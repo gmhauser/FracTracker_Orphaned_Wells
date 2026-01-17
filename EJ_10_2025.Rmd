@@ -1,0 +1,4595 @@
+---
+title: "Thesis"
+author: "Grace Hauser"
+date: "2025-07-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+library(tidyverse)
+library(sf)
+library(dplyr) 
+library(tigris) 
+library(stringr)
+library(MASS)
+library(corrplot)
+library(meta)
+library(grid)
+library(metafor)
+```
+ 
+### Import datasets
+
+```{r setup}
+# Hauser wells dataset
+wells = st_read("/Users/gracehauser/Desktop/Publication/Results/hauser_2025.shp")
+
+# Newly plugged
+new_plggd = st_read("/Users/gracehauser/Desktop/Publication/Results/newly_plugged.shp")
+
+# Newly orphaned
+new_orphd = st_read("/Users/gracehauser/Desktop/Publication/Results/newly_orphaned.shp")
+
+# EJ dataset
+ej = read.csv("/Users/gracehauser/Desktop/Publication/Results/acs_ej_final.csv")
+# Clean GEOID_12 column
+ej$GEOID_12 = substr(ej$GEOID_12, 3, nchar(ej$GEOID_12) - 1)
+
+# Delete columns
+ej = subset(ej, select = -c(AREALAND, AREAWATER, Shape_Length, Shape_Area))
+
+# FTA dataset
+all_wells = read.csv("/Users/gracehauser/Desktop/Important/Yale/Thesis/00 - Data/FTA/wells_250131.csv")
+# Restrict to unplugged vs plugged categories
+all_wells = all_wells %>%
+  filter(ft_category %in% c("Production Well",
+                            "Plugged",
+                            "Other / Unknown",
+                            "Injection / Storage / Service")) %>%
+  filter(!is.na(latitude) & !is.na(longitude))
+
+all_wells_shp <- st_as_sf(all_wells, coords = c("longitude", "latitude"), 
+                          crs = 4326)
+```
+
+```{r summarize}
+# Hauser_2025 wells
+wells_grouped <- wells %>% 
+  group_by(state) %>%
+  summarize(count = n(), .groups = "drop")
+
+# Newly orphaned wells
+new_orphd %>% 
+  group_by(state) %>%
+  count()
+
+# Newly plugged wells
+new_plggd %>% 
+  group_by(State) %>%
+  count()
+
+# Stats
+attribute_counts <- wells %>%
+  st_drop_geometry() %>%
+  group_by(state) %>%  # Group by state
+  summarise(
+    api_10 = sum(!is.na(api_10)), 
+    lat = sum(!is.na(lat)), 
+    lon = sum(!is.na(lon)), 
+    county = sum(!is.na(county)), 
+    well_name = sum(!is.na(well_name)), 
+    operator = sum(!is.na(operator)), 
+    well_status = sum(!is.na(well_statu)), 
+    spud_date = sum(!is.na(spud_date))) %>%
+  summarise(
+    across(everything(), ~ sum(. > 0))  # Count states with at least one non-missing value
+  )
+
+# Print the results
+print(attribute_counts)
+```
+
+
+### Summarize orphaned wells by CBG
+### Start with Alabama, then will iterate after getting it to work
+
+```{r alabama}
+# CBG shapefile
+al_cbg <- block_groups(state = 'AL', year = 2021, class = "sf")
+# Convert CRS to WGS84
+al_cbg <- st_transform(al_cbg, crs = 4326)
+# EJ dataset
+al_ej = ej %>%
+  filter(ST_ABBREV == 'AL')
+
+# Join ej data to shapefile
+al_cbg_ej <- al_cbg %>% 
+  left_join(al_ej, by=c('GEOID' = 'GEOID_12')) %>%
+  mutate(POP_DENSITY = POP / ALAND)
+
+# Wells
+al_wells = wells %>%
+  filter(wells$st_abbrev == 'AL')
+
+# CBG polygons contain points
+al_cbg_ej_wells <- st_intersection(al_wells, al_cbg_ej) 
+
+# make summary df
+agg_tbl <- al_cbg_ej_wells %>% 
+  group_by(GEOID) %>% 
+  summarise(Orphaned=n(),
+            .groups = 'drop')
+```
+
+### Summarize unplugged, plugged, and all wells by CBG
+### Start with Alabama, then will iterate after getting it to work
+
+```{r alabama plugged}
+# Select AL plugged wells
+al_plugged <- all_wells_shp %>%
+  filter(stusps == 'AL' & ft_category == 'Plugged')
+
+# Define chunk size
+chunk_size <- 1000
+
+# Create an empty list to store results
+results_list <- list()
+
+# Loop over the dataset in chunks of 100 rows
+for (i in seq(1, nrow(al_plugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- al_plugged[i:min(i + chunk_size - 1, nrow(al_plugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, al_cbg)
+  
+  # Append result to the list
+  results_list[[length(results_list) + 1]] <- chunk_intersection
+}
+
+# Combine all chunks into a single dataframe
+al_plugged_shp <- do.call(rbind, results_list)
+
+```
+
+```{r alabama unplugged}
+# Select AL unplugged wells
+al_unplugged <- all_wells_shp %>%
+  filter(stusps == 'AL' & ft_category != 'Plugged')
+
+# Loop over the dataset in chunks of 100 rows
+results_list2 <- list()
+
+for (i in seq(1, nrow(al_unplugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- al_unplugged[i:min(i + chunk_size - 1, nrow(al_unplugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, al_cbg)
+  
+  # Append result to the list
+  results_list2[[length(results_list2) + 1]] <- chunk_intersection
+}
+
+# Combine all chunks into a single dataframe
+al_unplugged_shp <- do.call(rbind, results_list2)
+```
+
+```{r al summary}
+# make summary df
+agg_tbl2 <- al_plugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Plugged=n(),
+            .groups = 'drop') 
+# make summary df
+agg_tbl3 <- al_unplugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Unplugged=n(),
+            .groups = 'drop') 
+
+# Merge summarized well counts back with the original al_cbg_ej data
+al_hauser <- al_cbg_ej %>%
+  st_join(agg_tbl) %>%
+  st_join(agg_tbl2) %>%
+  st_join(agg_tbl3) %>%
+  replace_na(list(Orphaned = 0)) %>%
+  replace_na(list(Plugged = 0)) %>%
+  replace_na(list(Unplugged = 0)) %>%
+  rename(GEOID = GEOID.x) %>%
+  subset(select = -c(GEOID.y, GEOID.x.1, GEOID.y.1)) %>%
+  # Define sample: drop rows where orphaned, plugged, and unplugged are all 0
+  filter(!(Orphaned == 0 & Plugged == 0 & Unplugged == 0)) %>%
+  st_drop_geometry()
+
+#### SAVE FILE
+write.csv(al_hauser,
+          "/Users/gracehauser/Desktop/Publication/Results/EJ_state_summaries/AL.csv",
+          na = "")
+```
+
+#########################################
+# Arkansas
+#########################################
+
+```{r arkansas}
+# CBG shapefile
+ar_cbg <- block_groups(state = 'AR', year = 2021, class = "sf")
+# Convert CRS to WGS84
+ar_cbg <- st_transform(ar_cbg, crs = 4326)
+# EJ dataset
+ar_ej = ej %>%
+  filter(ST_ABBREV == 'AR')
+
+# Join ej data to shapefile
+ar_cbg_ej <- ar_cbg %>% 
+  left_join(ar_ej, by=c('GEOID' = 'GEOID_12')) %>%
+  mutate(POP_DENSITY = POP / ALAND)
+
+# Wells
+ar_wells = wells %>%
+  filter(wells$st_abbrev == 'AR')
+
+# CBG polygons contain points
+ar_cbg_ej_wells <- st_intersection(ar_wells, ar_cbg_ej) 
+
+# make summary df
+agg_tbl <- ar_cbg_ej_wells %>% 
+  group_by(GEOID) %>% 
+  summarise(Orphaned=n(),
+            .groups = 'drop')
+```
+
+# Arkansas has 0 plugged wells
+
+```{r arkansas unplugged}
+# Select AL unplugged wells
+ar_unplugged <- all_wells_shp %>%
+  filter(stusps == 'AR' & ft_category != 'Plugged')
+
+# Define chunk size
+chunk_size <- 5000
+
+# Loop over the dataset 
+results_list2 <- list()
+
+for (i in seq(1, nrow(ar_unplugged), by = chunk_size)) {
+  # Select a chunk
+  chunk <- ar_unplugged[i:min(i + chunk_size - 1, nrow(ar_unplugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, ar_cbg)
+  
+  # Append result to the list
+  results_list2[[length(results_list2) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(ar_unplugged))))
+}
+
+# Combine all chunks into a single dataframe
+ar_unplugged_shp <- do.call(rbind, results_list2)
+```
+
+```{r ar summary}
+# make summary df
+agg_tbl3 <- ar_unplugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Unplugged=n(),
+            .groups = 'drop') 
+
+# Merge summarized well counts back with the original ar_cbg_ej data
+ar_hauser <- ar_cbg_ej %>%
+  st_join(agg_tbl) %>%
+  st_join(agg_tbl3) %>%
+  replace_na(list(Orphaned = 0)) %>%
+  replace_na(list(Unplugged = 0)) %>%
+  # Make column for plugged
+  add_column(Plugged = 0) %>%
+  subset(select = -c(GEOID.y, GEOID)) %>%
+  # Define sample: drop rows where orphaned, plugged, and unplugged are all 0
+  filter(!(Orphaned == 0 & Plugged == 0 & Unplugged == 0)) %>%
+  st_drop_geometry()
+
+ar_hauser <- ar_hauser %>%
+  rename(GEOID = GEOID.x)
+
+#### SAVE FILE
+write.csv(ar_hauser,
+          "/Users/gracehauser/Desktop/Publication/Results/EJ_state_summaries/AR.csv",
+          na = "")
+```
+
+
+#########################################
+# Alaska
+#########################################
+
+```{r alaska}
+# CBG shapefile
+ak_cbg <- block_groups(state = 'AK', year = 2021, class = "sf")
+# Convert CRS to WGS84
+ak_cbg <- st_transform(ak_cbg, crs = 4326)
+# EJ dataset
+ak_ej = ej %>%
+  filter(ST_ABBREV == 'AK')
+
+# Join ej data to shapefile
+ak_cbg_ej <- ak_cbg %>% 
+  left_join(ak_ej, by=c('GEOID' = 'GEOID_12')) %>%
+  mutate(POP_DENSITY = POP / ALAND)
+
+# Wells
+ak_wells = wells %>%
+  filter(wells$st_abbrev == 'AK')
+
+# CBG polygons contain points
+ak_cbg_ej_wells <- st_intersection(ak_wells, ak_cbg_ej) 
+
+# make summary df
+agg_tbl <- ak_cbg_ej_wells %>% 
+  group_by(GEOID) %>% 
+  summarise(Orphaned=n(),
+            .groups = 'drop')
+
+```
+
+```{r alaska plugged}
+# FT doesnt have AK right now
+library(readxl)
+ak_wells = read_excel("/Users/gracehauser/Desktop/Important/Yale/Thesis/00 - Data/AK_wells.xlsx")
+ak_wells = as.data.frame(ak_wells)
+ak_wells = ak_wells[complete.cases(ak_wells[ , c("Wh_CalculatedLongitude", "Wh_CalculatedLatitude")]),]
+
+# Select AK plugged wells from AK state dataset
+plugged_statuses = c('Plugged & Abandoned','Surface Plug')
+
+ak_plugged <- ak_wells %>%
+  filter(CurrentStatus %in% plugged_statuses)
+
+ak_plugged <- st_as_sf(ak_plugged, coords = c("Wh_CalculatedLongitude", "Wh_CalculatedLatitude"), 
+                                   crs = 4326)
+
+# Define chunk size
+chunk_size <- 5000
+
+# Create an empty list to store results
+results_list <- list()
+
+# Loop over the dataset in chunks of 100 rows
+for (i in seq(1, nrow(ak_plugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- ak_plugged[i:min(i + chunk_size - 1, nrow(ak_plugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, ak_cbg, left = FALSE)
+  
+  # Append result to the list
+  results_list[[length(results_list) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(ak_plugged))))
+}
+
+# Combine all chunks into a single dataframe
+ak_plugged_shp <- do.call(rbind, results_list)
+
+```
+
+```{r alaska unplugged}
+# Select AK unplugged wells from AK state dataset
+plugged_statuses = c('Plugged & Abandoned','Surface Plug')
+
+ak_unplugged <- ak_wells %>%
+  filter(!(CurrentStatus %in% plugged_statuses))
+
+ak_unplugged <- st_as_sf(ak_unplugged, coords = c("Wh_CalculatedLongitude", "Wh_CalculatedLatitude"), 
+                                   crs = 4326)
+
+# Loop over the dataset in chunks of 5000 rows
+results_list2 <- list()
+
+for (i in seq(1, nrow(ak_unplugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- ak_unplugged[i:min(i + chunk_size - 1, nrow(ak_unplugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, ak_cbg)
+  
+  # Append result to the list
+  results_list2[[length(results_list2) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(ak_unplugged))))
+}
+
+# Combine all chunks into a single dataframe
+ak_unplugged_shp <- do.call(rbind, results_list2)
+```
+
+```{r ak summary}
+# make summary df
+agg_tbl2 <- ak_plugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Plugged=n(),
+            .groups = 'drop') 
+# make summary df
+agg_tbl3 <- ak_unplugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Unplugged=n(),
+            .groups = 'drop') 
+
+# Merge summarized well counts back with the original al_cbg_ej data
+ak_hauser <- ak_cbg_ej %>%
+  st_join(agg_tbl) %>%
+  st_join(agg_tbl2) %>%
+  st_join(agg_tbl3) %>%
+  replace_na(list(Orphaned = 0)) %>%
+  replace_na(list(Plugged = 0)) %>%
+  replace_na(list(Unplugged = 0)) %>%
+  rename(GEOID = GEOID.x) %>%
+  subset(select = -c(GEOID.y, GEOID.x.1, GEOID.y.1)) %>%
+  # Define sample: drop rows where orphaned, plugged, and unplugged are all 0
+  filter(!(Orphaned == 0 & Plugged == 0 & Unplugged == 0)) %>%
+  st_drop_geometry()
+
+#### SAVE FILE
+write.csv(ak_hauser,
+          "/Users/gracehauser/Desktop/Publication/Results/EJ_state_summaries/AK.csv",
+          na = "")
+```
+
+#########################################
+# California
+#########################################
+
+```{r california}
+# CBG shapefile
+ca_cbg <- block_groups(state = 'CA', year = 2021, class = "sf")
+# Convert CRS to WGS84
+ca_cbg <- st_transform(ca_cbg, crs = 4326)
+# EJ dataset
+ca_ej = ej %>%
+  filter(ST_ABBREV == 'CA')
+
+# Join ej data to shapefile
+ca_cbg_ej <- ca_cbg %>% 
+  left_join(ca_ej, by=c('GEOID' = 'GEOID_12')) %>%
+  mutate(POP_DENSITY = POP / ALAND)
+
+# Wells
+ca_wells = wells %>%
+  filter(wells$st_abbrev == 'CA')
+
+# CBG polygons contain points
+ca_cbg_ej_wells <- st_join(ca_wells, ca_cbg_ej)
+
+# make summary df
+agg_tbl <- ca_cbg_ej_wells %>% 
+  group_by(GEOID) %>% 
+  summarise(Orphaned=n(),
+            .groups = 'drop')
+```
+
+```{r california plugged}
+# Select CA plugged wells
+ca_plugged <- all_wells_shp %>%
+  filter(stusps == 'CA' & ft_category == 'Plugged')
+
+# Define chunk size
+chunk_size <- 5000
+
+# Create an empty list to store results
+results_list <- list()
+
+# Loop over the dataset in chunks of 100 rows
+for (i in seq(1, nrow(ca_plugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- ca_plugged[i:min(i + chunk_size - 1, nrow(ca_plugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, ca_cbg, left = FALSE)
+  
+  # Append result to the list
+  results_list[[length(results_list) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(ca_plugged))))
+}
+
+# Combine all chunks into a single dataframe
+ca_plugged_shp <- do.call(rbind, results_list)
+
+```
+
+```{r california unplugged}
+# Select CA unplugged wells
+ca_unplugged <- all_wells_shp %>%
+  filter(stusps == 'CA' & ft_category != 'Plugged')
+
+# Define chunk size
+chunk_size <- 5000
+
+# Loop over the dataset in chunks of 100 rows
+results_list2 <- list()
+
+for (i in seq(1, nrow(ca_unplugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- ca_unplugged[i:min(i + chunk_size - 1, nrow(ca_unplugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, ca_cbg)
+  
+  # Append result to the list
+  results_list2[[length(results_list2) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(ca_unplugged))))
+}
+
+# Combine all chunks into a single dataframe
+ca_unplugged_shp <- do.call(rbind, results_list2)
+```
+
+```{r ca summary}
+# make summary df
+agg_tbl2 <- ca_plugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Plugged=n(),
+            .groups = 'drop') 
+# make summary df
+agg_tbl3 <- ca_unplugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Unplugged=n(),
+            .groups = 'drop') 
+
+# Merge summarized well counts back with the original al_cbg_ej data
+ca_hauser <- ca_cbg_ej %>%
+  st_join(agg_tbl) %>%
+  st_join(agg_tbl2) %>%
+  st_join(agg_tbl3) %>%
+  replace_na(list(Orphaned = 0)) %>%
+  replace_na(list(Plugged = 0)) %>%
+  replace_na(list(Unplugged = 0)) %>%
+  
+  rename(GEOID = GEOID.x) %>%
+  subset(select = -c(GEOID.y, GEOID.x.1, GEOID.y.1)) %>%
+  # Define sample: drop rows where orphaned, plugged, and unplugged are all 0
+  filter(!(Orphaned == 0 & Plugged == 0 & Unplugged == 0)) %>%
+  st_drop_geometry()
+
+#### SAVE FILE
+write.csv(ca_hauser,
+          "/Users/gracehauser/Desktop/Publication/Results/EJ_state_summaries/CA.csv",
+          na = "")
+```
+
+#########################################
+# Colorado
+#########################################
+
+```{r colorado}
+# CBG shapefile
+co_cbg <- block_groups(state = 'CO', year = 2021, class = "sf")
+# Convert CRS to WGS84
+co_cbg <- st_transform(co_cbg, crs = 4326)
+# EJ dataset
+co_ej = ej %>%
+  filter(STATE == 'Colorado')
+
+# Join ej data to shapefile
+co_cbg_ej <- co_cbg %>% 
+  left_join(co_ej, by=c('GEOID' = 'GEOID_12')) %>%
+  mutate(POP_DENSITY = POP / ALAND)
+
+# Wells
+co_wells = wells %>%
+  filter(wells$state == 'Colorado')
+
+# CBG polygons contain points
+co_cbg_ej_wells <- st_join(co_wells, co_cbg_ej)
+
+# make summary df
+agg_tbl <- co_cbg_ej_wells %>% 
+  group_by(GEOID) %>% 
+  summarise(Orphaned=n(),
+            .groups = 'drop')
+```
+
+```{r colorado plugged}
+# Select CO plugged wells
+co_plugged <- all_wells_shp %>%
+  filter(stusps == 'CO' & ft_category == 'Plugged')
+
+# Define chunk size
+chunk_size <- 5000
+
+# Create an empty list to store results
+results_list <- list()
+
+# Loop over the dataset in chunks of 100 rows
+for (i in seq(1, nrow(co_plugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- co_plugged[i:min(i + chunk_size - 1, nrow(co_plugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, co_cbg, left = FALSE)
+  
+  # Append result to the list
+  results_list[[length(results_list) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(co_plugged))))
+}
+
+# Combine all chunks into a single dataframe
+co_plugged_shp <- do.call(rbind, results_list)
+
+```
+
+```{r colorado unplugged}
+# Select CO unplugged wells
+co_unplugged <- all_wells_shp %>%
+  filter(stusps == 'CO' & ft_category != 'Plugged')
+
+# Loop over the dataset in chunks of 5000 rows
+results_list2 <- list()
+
+for (i in seq(1, nrow(co_unplugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- co_unplugged[i:min(i + chunk_size - 1, nrow(co_unplugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, co_cbg)
+  
+  # Append result to the list
+  results_list2[[length(results_list2) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(co_unplugged))))
+}
+
+# Combine all chunks into a single dataframe
+co_unplugged_shp <- do.call(rbind, results_list2)
+```
+
+```{r co summary}
+# make summary df
+agg_tbl2 <- co_plugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Plugged=n(),
+            .groups = 'drop') 
+# make summary df
+agg_tbl3 <- co_unplugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Unplugged=n(),
+            .groups = 'drop') 
+
+# Merge summarized well counts back with the original al_cbg_ej data
+co_hauser <- co_cbg_ej %>%
+  st_join(agg_tbl) %>%
+  st_join(agg_tbl2) %>%
+  st_join(agg_tbl3) %>%
+  replace_na(list(Orphaned = 0)) %>%
+  replace_na(list(Plugged = 0)) %>%
+  replace_na(list(Unplugged = 0)) %>%
+  rename(GEOID = GEOID.x) %>%
+  subset(select = -c(GEOID.y, GEOID.x.1, GEOID.y.1)) %>%
+  # Define sample: drop rows where orphaned, plugged, and unplugged are all 0
+  filter(!(Orphaned == 0 & Plugged == 0 & Unplugged == 0)) %>%
+  st_drop_geometry()
+
+#### SAVE FILE
+write.csv(co_hauser,
+          "/Users/gracehauser/Desktop/Publication/Results/EJ_state_summaries/CO.csv",
+          na = "")
+```
+
+#########################################
+# Florida
+#########################################
+
+```{r florida}
+# CBG shapefile
+fl_cbg <- block_groups(state = 'FL', year = 2021, class = "sf")
+# Convert CRS to WGS84
+fl_cbg <- st_transform(fl_cbg, crs = 4326)
+# EJ dataset
+fl_ej = ej %>%
+  filter(STATE == 'Florida')
+
+# Join ej data to shapefile
+fl_cbg_ej <- fl_cbg %>% 
+  left_join(fl_ej, by=c('GEOID' = 'GEOID_12')) %>%
+  mutate(POP_DENSITY = POP / ALAND)
+
+# Wells
+fl_wells = wells %>%
+  filter(wells$state == 'Florida')
+
+# CBG polygons contain points
+fl_cbg_ej_wells <- st_join(fl_wells, fl_cbg_ej)
+
+# make summary df
+agg_tbl <- fl_cbg_ej_wells %>% 
+  group_by(GEOID) %>% 
+  summarise(Orphaned=n(),
+            .groups = 'drop')
+```
+
+```{r florida plugged}
+# Select FL plugged wells
+fl_plugged <- all_wells_shp %>%
+  filter(stusps == 'FL' & ft_category == 'Plugged')
+
+# Define chunk size
+chunk_size <- 5000
+
+# Create an empty list to store results
+results_list <- list()
+
+# Loop over the dataset in chunks of 100 rows
+for (i in seq(1, nrow(fl_plugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- fl_plugged[i:min(i + chunk_size - 1, nrow(fl_plugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, fl_cbg, left = FALSE)
+  
+  # Append result to the list
+  results_list[[length(results_list) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(fl_plugged))))
+}
+
+# Combine all chunks into a single dataframe
+fl_plugged_shp <- do.call(rbind, results_list)
+
+```
+
+```{r florida unplugged}
+# Select FL unplugged wells
+fl_unplugged <- all_wells_shp %>%
+  filter(stusps == 'FL' & ft_category != 'Plugged')
+
+# Loop over the dataset in chunks of 5000 rows
+results_list2 <- list()
+
+for (i in seq(1, nrow(fl_unplugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- fl_unplugged[i:min(i + chunk_size - 1, nrow(fl_unplugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, fl_cbg)
+  
+  # Append result to the list
+  results_list2[[length(results_list2) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(fl_unplugged))))
+}
+
+# Combine all chunks into a single dataframe
+fl_unplugged_shp <- do.call(rbind, results_list2)
+```
+
+```{r fl summary}
+# make summary df
+agg_tbl2 <- fl_plugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Plugged=n(),
+            .groups = 'drop') 
+# make summary df
+agg_tbl3 <- fl_unplugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Unplugged=n(),
+            .groups = 'drop') 
+
+# Merge summarized well counts back with the original al_cbg_ej data
+fl_hauser <- fl_cbg_ej %>%
+  st_join(agg_tbl) %>%
+  st_join(agg_tbl2) %>%
+  st_join(agg_tbl3) %>%
+  replace_na(list(Orphaned = 0)) %>%
+  replace_na(list(Plugged = 0)) %>%
+  replace_na(list(Unplugged = 0)) %>%
+  rename(GEOID = GEOID.x) %>%
+  subset(select = -c(GEOID.y, GEOID.x.1, GEOID.y.1)) %>%
+  # Define sample: drop rows where orphaned, plugged, and unplugged are all 0
+  filter(!(Orphaned == 0 & Plugged == 0 & Unplugged == 0)) %>%
+  st_drop_geometry()
+
+#### SAVE FILE
+write.csv(fl_hauser,
+          "/Users/gracehauser/Desktop/Publication/Results/EJ_state_summaries/FL.csv",
+          na = "")
+```
+
+#########################################
+# Indiana
+#########################################
+
+```{r indiana}
+# CBG shapefile
+in_cbg <- block_groups(state = 'IN', year = 2021, class = "sf")
+# Convert CRS to WGS84
+in_cbg <- st_transform(in_cbg, crs = 4326)
+# EJ dataset
+in_ej = ej %>%
+  filter(STATE == 'Indiana')
+
+# Join ej data to shapefile
+in_cbg_ej <- in_cbg %>% 
+  left_join(in_ej, by=c('GEOID' = 'GEOID_12')) %>%
+  mutate(POP_DENSITY = POP / ALAND)
+
+# Wells
+in_wells = wells %>%
+  filter(wells$state == 'Indiana')
+
+# CBG polygons contain points
+in_cbg_ej_wells <- st_join(in_wells, in_cbg_ej)
+
+# make summary df
+agg_tbl <- in_cbg_ej_wells %>% 
+  group_by(GEOID) %>% 
+  summarise(Orphaned=n(),
+            .groups = 'drop')
+```
+
+# No plugged wells
+
+```{r indiana unplugged}
+# Select IN unplugged wells
+in_unplugged <- all_wells_shp %>%
+  filter(stusps == 'IN' & ft_category != 'Plugged')
+
+# Loop over the dataset in chunks of 5000 rows
+results_list2 <- list()
+
+for (i in seq(1, nrow(in_unplugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- in_unplugged[i:min(i + chunk_size - 1, nrow(in_unplugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, in_cbg)
+  
+  # Append result to the list
+  results_list2[[length(results_list2) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(in_unplugged))))
+}
+
+# Combine all chunks into a single dataframe
+in_unplugged_shp <- do.call(rbind, results_list2)
+```
+
+```{r in summary}
+# make summary df
+agg_tbl2 <- in_plugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Plugged=n(),
+            .groups = 'drop') 
+# make summary df
+agg_tbl3 <- in_unplugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Unplugged=n(),
+            .groups = 'drop') 
+
+# Merge summarized well counts back with the original al_cbg_ej data
+in_hauser <- in_cbg_ej %>%
+  st_join(agg_tbl) %>%
+  st_join(agg_tbl2) %>%
+  st_join(agg_tbl3) %>%
+  replace_na(list(Orphaned = 0)) %>%
+  replace_na(list(Plugged = 0)) %>%
+  replace_na(list(Unplugged = 0)) %>%
+  rename(GEOID = GEOID.x) %>%
+  subset(select = -c(GEOID.y, GEOID.x.1, GEOID.y.1)) %>%
+  # Define sample: drop rows where orphaned, plugged, and unplugged are all 0
+  filter(!(Orphaned == 0 & Plugged == 0 & Unplugged == 0)) %>%
+  st_drop_geometry()
+
+#### SAVE FILE
+write.csv(in_hauser,
+          "/Users/gracehauser/Desktop/Publication/Results/EJ_state_summaries/IN.csv",
+          na = "")
+```
+
+#########################################
+# Kansas
+#########################################
+
+```{r kansas}
+# CBG shapefile
+ks_cbg <- block_groups(state = 'KS', year = 2021, class = "sf")
+# Convert CRS to WGS84
+ks_cbg <- st_transform(ks_cbg, crs = 4326)
+# EJ dataset
+ks_ej = ej %>%
+  filter(STATE == 'Kansas')
+
+# Join ej data to shapefile
+ks_cbg_ej <- ks_cbg %>% 
+  left_join(ks_ej, by=c('GEOID' = 'GEOID_12')) %>%
+  mutate(POP_DENSITY = POP / ALAND)
+
+# Wells
+ks_wells = wells %>%
+  filter(wells$state == 'Kansas')
+
+# CBG polygons contain points
+ks_cbg_ej_wells <- st_join(ks_wells, ks_cbg_ej)
+
+# make summary df
+agg_tbl <- ks_cbg_ej_wells %>% 
+  group_by(GEOID) %>% 
+  summarise(Orphaned=n(),
+            .groups = 'drop')
+```
+
+```{r kansas plugged}
+# Select KS plugged wells
+ks_plugged <- all_wells_shp %>%
+  filter(stusps == 'KS' & ft_category == 'Plugged')
+
+# Define chunk size
+chunk_size <- 5000
+
+# Create an empty list to store results
+results_list <- list()
+
+# Loop over the dataset in chunks of 100 rows
+for (i in seq(1, nrow(ks_plugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- ks_plugged[i:min(i + chunk_size - 1, nrow(ks_plugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, ks_cbg, left = FALSE)
+  
+  # Append result to the list
+  results_list[[length(results_list) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(ks_plugged))))
+}
+
+# Combine all chunks into a single dataframe
+ks_plugged_shp <- do.call(rbind, results_list)
+
+```
+
+```{r kansas unplugged}
+# Select KS unplugged wells
+ks_unplugged <- all_wells_shp %>%
+  filter(stusps == 'KS' & ft_category != 'Plugged')
+
+# Loop over the dataset in chunks of 5000 rows
+results_list2 <- list()
+
+for (i in seq(1, nrow(ks_unplugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- ks_unplugged[i:min(i + chunk_size - 1, nrow(ks_unplugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, ks_cbg)
+  
+  # Append result to the list
+  results_list2[[length(results_list2) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(ks_unplugged))))
+}
+
+# Combine all chunks into a single dataframe
+ks_unplugged_shp <- do.call(rbind, results_list2)
+```
+
+```{r ks summary}
+# make summary df
+agg_tbl2 <- ks_plugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Plugged=n(),
+            .groups = 'drop') 
+# make summary df
+agg_tbl3 <- ks_unplugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Unplugged=n(),
+            .groups = 'drop') 
+
+# Merge summarized well counts back with the original al_cbg_ej data
+ks_hauser <- ks_cbg_ej %>%
+  st_join(agg_tbl) %>%
+  st_join(agg_tbl2) %>%
+  st_join(agg_tbl3) %>%
+  replace_na(list(Orphaned = 0)) %>%
+  replace_na(list(Plugged = 0)) %>%
+  replace_na(list(Unplugged = 0)) %>%
+  rename(GEOID = GEOID.x) %>%
+  subset(select = -c(GEOID.y, GEOID.x.1, GEOID.y.1)) %>%
+  # Define sample: drop rows where orphaned, plugged, and unplugged are all 0
+  filter(!(Orphaned == 0 & Plugged == 0 & Unplugged == 0)) %>%
+  st_drop_geometry()
+
+#### SAVE FILE
+write.csv(ks_hauser,
+          "/Users/gracehauser/Desktop/Publication/Results/EJ_state_summaries/KS.csv",
+          na = "")
+```
+
+#########################################
+# Kentucky
+#########################################
+
+```{r kentucky}
+# CBG shapefile
+ky_cbg <- block_groups(state = 'KY', year = 2021, class = "sf")
+# Convert CRS to WGS84
+ky_cbg <- st_transform(ky_cbg, crs = 4326)
+# EJ dataset
+ky_ej = ej %>%
+  filter(STATE == 'Kentucky')
+
+# Join ej data to shapefile
+ky_cbg_ej <- ky_cbg %>% 
+  left_join(ky_ej, by=c('GEOID' = 'GEOID_12')) %>%
+  mutate(POP_DENSITY = POP / ALAND)
+
+# Wells
+ky_wells = wells %>%
+  filter(wells$state == 'Kentucky')
+
+# CBG polygons contain points
+ky_cbg_ej_wells <- st_join(ky_wells, ky_cbg_ej)
+
+# make summary df
+agg_tbl <- ky_cbg_ej_wells %>% 
+  group_by(GEOID) %>% 
+  summarise(Orphaned=n(),
+            .groups = 'drop')
+```
+
+# KY doesnt have plugged wells
+
+```{r kentucky unplugged}
+# Select KY unplugged wells
+ky_unplugged <- all_wells_shp %>%
+  filter(stusps == 'KY' & ft_category != 'Plugged')
+
+# Loop over the dataset in chunks of 5000 rows
+results_list2 <- list()
+
+for (i in seq(1, nrow(ky_unplugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- ky_unplugged[i:min(i + chunk_size - 1, nrow(ky_unplugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, ky_cbg)
+  
+  # Append result to the list
+  results_list2[[length(results_list2) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(ky_unplugged))))
+}
+
+# Combine all chunks into a single dataframe
+ky_unplugged_shp <- do.call(rbind, results_list2)
+```
+
+```{r ky summary}
+# make summary df
+agg_tbl3 <- ky_unplugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Unplugged=n(),
+            .groups = 'drop') 
+
+# Merge summarized well counts back with the original al_cbg_ej data
+ky_hauser <- ky_cbg_ej %>%
+  st_join(agg_tbl) %>%
+  st_join(agg_tbl3) %>%
+  replace_na(list(Orphaned = 0)) %>%
+  replace_na(list(Unplugged = 0)) %>%
+  # Make column for plugged
+  add_column(Plugged = 0) %>%
+  subset(select = -c(GEOID.y, GEOID)) %>%
+  #rename(GEOID = GEOID.x) %>%
+  # Define sample: drop rows where orphaned, plugged, and unplugged are all 0
+  filter(!(Orphaned == 0 & Plugged == 0 & Unplugged == 0)) %>%
+  st_drop_geometry()
+
+ky_hauser <- ky_hauser %>%
+  rename(GEOID = GEOID.x)
+
+#### SAVE FILE
+write.csv(ky_hauser,
+          "/Users/gracehauser/Desktop/Publication/Results/EJ_state_summaries/KY.csv",
+          na = "")
+```
+
+#########################################
+# Louisiana
+#########################################
+
+```{r louisiana}
+# CBG shapefile
+la_cbg <- block_groups(state = 'LA', year = 2021, class = "sf")
+# Convert CRS to WGS84
+la_cbg <- st_transform(la_cbg, crs = 4326)
+# EJ dataset
+la_ej = ej %>%
+  filter(STATE == 'Louisiana')
+
+# Join ej data to shapefile
+la_cbg_ej <- la_cbg %>% 
+  left_join(la_ej, by=c('GEOID' = 'GEOID_12')) %>%
+  mutate(POP_DENSITY = POP / ALAND)
+
+# Wells
+la_wells = wells %>%
+  filter(wells$state == 'Louisiana')
+
+# CBG polygons contain points
+la_cbg_ej_wells <- st_join(la_wells, la_cbg_ej)
+
+# make summary df
+agg_tbl <- la_cbg_ej_wells %>% 
+  group_by(GEOID) %>% 
+  summarise(Orphaned=n(),
+            .groups = 'drop')
+```
+
+```{r louisiana plugged}
+# Select LA plugged wells
+la_plugged <- all_wells_shp %>%
+  filter(stusps == 'LA' & ft_category == 'Plugged')
+
+# Define chunk size
+chunk_size <- 5000
+
+# Create an empty list to store results
+results_list <- list()
+
+# Loop over the dataset in chunks of 100 rows
+for (i in seq(1, nrow(la_plugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- la_plugged[i:min(i + chunk_size - 1, nrow(la_plugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, la_cbg, left = FALSE)
+  
+  # Append result to the list
+  results_list[[length(results_list) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(la_plugged))))
+}
+
+# Combine all chunks into a single dataframe
+la_plugged_shp <- do.call(rbind, results_list)
+
+```
+
+```{r louisiana unplugged}
+# Select LA unplugged wells
+la_unplugged <- all_wells_shp %>%
+  filter(stusps == 'LA' & ft_category != 'Plugged')
+
+# Loop over the dataset in chunks of 5000 rows
+results_list2 <- list()
+
+for (i in seq(1, nrow(la_unplugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- la_unplugged[i:min(i + chunk_size - 1, nrow(la_unplugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, la_cbg)
+  
+  # Append result to the list
+  results_list2[[length(results_list2) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(la_unplugged))))
+}
+
+# Combine all chunks into a single dataframe
+la_unplugged_shp <- do.call(rbind, results_list2)
+```
+
+```{r la summary}
+# make summary df
+agg_tbl2 <- la_plugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Plugged=n(),
+            .groups = 'drop') 
+# make summary df
+agg_tbl3 <- la_unplugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Unplugged=n(),
+            .groups = 'drop') 
+
+# Merge summarized well counts back with the original al_cbg_ej data
+la_hauser <- la_cbg_ej %>%
+  st_join(agg_tbl) %>%
+  st_join(agg_tbl2) %>%
+  st_join(agg_tbl3) %>%
+  replace_na(list(Orphaned = 0)) %>%
+  replace_na(list(Plugged = 0)) %>%
+  replace_na(list(Unplugged = 0)) %>%
+  rename(GEOID = GEOID.x) %>%
+  subset(select = -c(GEOID.y, GEOID.x.1, GEOID.y.1)) %>%
+  # Define sample: drop rows where orphaned, plugged, and unplugged are all 0
+  filter(!(Orphaned == 0 & Plugged == 0 & Unplugged == 0)) %>%
+  st_drop_geometry()
+
+#### SAVE FILE
+write.csv(la_hauser,
+          "/Users/gracehauser/Desktop/Publication/Results/EJ_state_summaries/LA.csv",
+          na = "")
+```
+
+#########################################
+# Michigan
+#########################################
+
+```{r michigan}
+# CBG shapefile
+mi_cbg <- block_groups(state = 'MI', year = 2021, class = "sf")
+# Convert CRS to WGS84
+mi_cbg <- st_transform(mi_cbg, crs = 4326)
+# EJ dataset
+mi_ej = ej %>%
+  filter(STATE == 'Michigan')
+
+# Join ej data to shapefile
+mi_cbg_ej <- mi_cbg %>% 
+  left_join(mi_ej, by=c('GEOID' = 'GEOID_12')) %>%
+  mutate(POP_DENSITY = POP / ALAND)
+
+# Wells
+mi_wells = wells %>%
+  filter(wells$state == 'Michigan')
+
+# CBG polygons contain points
+mi_cbg_ej_wells <- st_join(mi_wells, mi_cbg_ej)
+
+# make summary df
+agg_tbl <- mi_cbg_ej_wells %>% 
+  group_by(GEOID) %>% 
+  summarise(Orphaned=n(),
+            .groups = 'drop')
+```
+
+```{r michigan plugged}
+# Select MI plugged wells
+mi_plugged <- all_wells_shp %>%
+  filter(stusps == 'MI' & ft_category == 'Plugged')
+
+# Define chunk size
+chunk_size <- 5000
+
+# Create an empty list to store results
+results_list <- list()
+
+# Loop over the dataset in chunks of 100 rows
+for (i in seq(1, nrow(mi_plugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- mi_plugged[i:min(i + chunk_size - 1, nrow(mi_plugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, mi_cbg, left = FALSE)
+  
+  # Append result to the list
+  results_list[[length(results_list) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(mi_plugged))))
+}
+
+# Combine all chunks into a single dataframe
+mi_plugged_shp <- do.call(rbind, results_list)
+
+```
+
+```{r michigan unplugged}
+# Select MI unplugged wells
+mi_unplugged <- all_wells_shp %>%
+  filter(stusps == 'MI' & ft_category != 'Plugged')
+
+# Loop over the dataset in chunks of 5000 rows
+results_list2 <- list()
+
+for (i in seq(1, nrow(mi_unplugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- mi_unplugged[i:min(i + chunk_size - 1, nrow(mi_unplugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, mi_cbg)
+  
+  # Append result to the list
+  results_list2[[length(results_list2) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(mi_unplugged))))
+}
+
+# Combine all chunks into a single dataframe
+mi_unplugged_shp <- do.call(rbind, results_list2)
+```
+
+```{r mi summary}
+# make summary df
+agg_tbl2 <- mi_plugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Plugged=n(),
+            .groups = 'drop') 
+# make summary df
+agg_tbl3 <- mi_unplugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Unplugged=n(),
+            .groups = 'drop') 
+
+# Merge summarized well counts back with the original al_cbg_ej data
+mi_hauser <- mi_cbg_ej %>%
+  st_join(agg_tbl) %>%
+  st_join(agg_tbl2) %>%
+  st_join(agg_tbl3) %>%
+  replace_na(list(Orphaned = 0)) %>%
+  replace_na(list(Plugged = 0)) %>%
+  replace_na(list(Unplugged = 0)) %>%
+  rename(GEOID = GEOID.x) %>%
+  subset(select = -c(GEOID.y, GEOID.x.1, GEOID.y.1)) %>%
+  # Define sample: drop rows where orphaned, plugged, and unplugged are all 0
+  filter(!(Orphaned == 0 & Plugged == 0 & Unplugged == 0)) %>%
+  st_drop_geometry()
+
+#### SAVE FILE
+write.csv(mi_hauser,
+          "/Users/gracehauser/Desktop/Publication/Results/EJ_state_summaries/MI.csv",
+          na = "")
+```
+
+#########################################
+# Mississippi
+#########################################
+
+```{r mississippi}
+# CBG shapefile
+ms_cbg <- block_groups(state = 'MS', year = 2021, class = "sf")
+# Convert CRS to WGS84
+ms_cbg <- st_transform(ms_cbg, crs = 4326)
+# EJ dataset
+ms_ej = ej %>%
+  filter(STATE == 'Mississippi')
+
+# Join ej data to shapefile
+ms_cbg_ej <- ms_cbg %>% 
+  left_join(ms_ej, by=c('GEOID' = 'GEOID_12')) %>%
+  mutate(POP_DENSITY = POP / ALAND)
+
+# Wells
+ms_wells = wells %>%
+  filter(wells$state == 'Mississippi')
+
+# CBG polygons contain points
+ms_cbg_ej_wells <- st_join(ms_wells, ms_cbg_ej)
+
+# make summary df
+agg_tbl <- ms_cbg_ej_wells %>% 
+  group_by(GEOID) %>% 
+  summarise(Orphaned=n(),
+            .groups = 'drop')
+```
+
+```{r mississippi plugged}
+# Select MS plugged wells
+ms_plugged <- all_wells_shp %>%
+  filter(stusps == 'MS' & ft_category == 'Plugged')
+
+# Define chunk size
+chunk_size <- 5000
+
+# Create an empty list to store results
+results_list <- list()
+
+# Loop over the dataset in chunks of 100 rows
+for (i in seq(1, nrow(ms_plugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- ms_plugged[i:min(i + chunk_size - 1, nrow(ms_plugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, ms_cbg, left = FALSE)
+  
+  # Append result to the list
+  results_list[[length(results_list) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(ms_plugged))))
+}
+
+# Combine all chunks into a single dataframe
+ms_plugged_shp <- do.call(rbind, results_list)
+
+```
+
+```{r mississippi unplugged}
+# Select MI unplugged wells
+mi_unplugged <- all_wells_shp %>%
+  filter(stusps == 'MI' & ft_category != 'Plugged')
+
+# Loop over the dataset in chunks of 5000 rows
+results_list2 <- list()
+
+for (i in seq(1, nrow(mi_unplugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- mi_unplugged[i:min(i + chunk_size - 1, nrow(mi_unplugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, mi_cbg)
+  
+  # Append result to the list
+  results_list2[[length(results_list2) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(mi_unplugged))))
+}
+
+# Combine all chunks into a single dataframe
+ms_unplugged_shp <- do.call(rbind, results_list2)
+```
+
+```{r ms summary}
+# make summary df
+agg_tbl2 <- ms_plugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Plugged=n(),
+            .groups = 'drop') 
+# make summary df
+agg_tbl3 <- ms_unplugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Unplugged=n(),
+            .groups = 'drop') 
+
+# Merge summarized well counts back with the original al_cbg_ej data
+ms_hauser <- ms_cbg_ej %>%
+  st_join(agg_tbl) %>%
+  st_join(agg_tbl2) %>%
+  st_join(agg_tbl3) %>%
+  replace_na(list(Orphaned = 0)) %>%
+  replace_na(list(Plugged = 0)) %>%
+  replace_na(list(Unplugged = 0)) %>%
+  rename(GEOID = GEOID.x) %>%
+  subset(select = -c(GEOID.y, GEOID.x.1, GEOID.y.1)) %>%
+  # Define sample: drop rows where orphaned, plugged, and unplugged are all 0
+  filter(!(Orphaned == 0 & Plugged == 0 & Unplugged == 0)) %>%
+  st_drop_geometry()
+
+#### SAVE FILE
+write.csv(ms_hauser,
+          "/Users/gracehauser/Desktop/Publication/Results/EJ_state_summaries/MS.csv",
+          na = "")
+```
+
+#########################################
+# Missouri
+#########################################
+
+```{r missouri}
+# CBG shapefile
+mo_cbg <- block_groups(state = 'MO', year = 2021, class = "sf")
+# Convert CRS to WGS84
+mo_cbg <- st_transform(mo_cbg, crs = 4326)
+# EJ dataset
+mo_ej = ej %>%
+  filter(STATE == 'Missouri')
+
+# Join ej data to shapefile
+mo_cbg_ej <- mo_cbg %>% 
+  left_join(mo_ej, by=c('GEOID' = 'GEOID_12')) %>%
+  mutate(POP_DENSITY = POP / ALAND)
+
+# Wells
+mo_wells = wells %>%
+  filter(wells$state == 'Missouri')
+
+# CBG polygons contain points
+mo_cbg_ej_wells <- st_join(mo_wells, mo_cbg_ej)
+
+# make summary df
+agg_tbl <- mo_cbg_ej_wells %>% 
+  group_by(GEOID) %>% 
+  summarise(Orphaned=n(),
+            .groups = 'drop')
+```
+
+```{r missouri plugged}
+# Select MO plugged wells
+mo_plugged <- all_wells_shp %>%
+  filter(stusps == 'MO' & ft_category == 'Plugged')
+
+# Define chunk size
+chunk_size <- 5000
+
+# Create an empty list to store results
+results_list <- list()
+
+# Loop over the dataset in chunks of 100 rows
+for (i in seq(1, nrow(mo_plugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- mo_plugged[i:min(i + chunk_size - 1, nrow(mo_plugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, mo_cbg, left = FALSE)
+  
+  # Append result to the list
+  results_list[[length(results_list) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(mo_plugged))))
+}
+
+# Combine all chunks into a single dataframe
+mo_plugged_shp <- do.call(rbind, results_list)
+
+```
+
+```{r missouri unplugged}
+# Select MO unplugged wells
+mo_unplugged <- all_wells_shp %>%
+  filter(stusps == 'MO' & ft_category != 'Plugged')
+
+# Loop over the dataset in chunks of 5000 rows
+results_list2 <- list()
+
+for (i in seq(1, nrow(mo_unplugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- mo_unplugged[i:min(i + chunk_size - 1, nrow(mo_unplugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, mo_cbg)
+  
+  # Append result to the list
+  results_list2[[length(results_list2) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(mo_unplugged))))
+}
+
+# Combine all chunks into a single dataframe
+mo_unplugged_shp <- do.call(rbind, results_list2)
+```
+
+```{r mo summary}
+# make summary df
+agg_tbl2 <- mo_plugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Plugged=n(),
+            .groups = 'drop') 
+# make summary df
+agg_tbl3 <- mo_unplugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Unplugged=n(),
+            .groups = 'drop') 
+
+# Merge summarized well counts back with the original al_cbg_ej data
+mo_hauser <- mo_cbg_ej %>%
+  st_join(agg_tbl) %>%
+  st_join(agg_tbl2) %>%
+  st_join(agg_tbl3) %>%
+  replace_na(list(Orphaned = 0)) %>%
+  replace_na(list(Plugged = 0)) %>%
+  replace_na(list(Unplugged = 0)) %>%
+  rename(GEOID = GEOID.x) %>%
+  subset(select = -c(GEOID.y, GEOID.x.1, GEOID.y.1)) %>%
+  # Define sample: drop rows where orphaned, plugged, and unplugged are all 0
+  filter(!(Orphaned == 0 & Plugged == 0 & Unplugged == 0)) %>%
+  st_drop_geometry()
+
+#### SAVE FILE
+write.csv(mo_hauser,
+          "/Users/gracehauser/Desktop/Publication/Results/EJ_state_summaries/MO.csv",
+          na = "")
+```
+
+#########################################
+# Montana
+#########################################
+
+```{r montana}
+# CBG shapefile
+mt_cbg <- block_groups(state = 'MT', year = 2021, class = "sf")
+# Convert CRS to WGS84
+mt_cbg <- st_transform(mt_cbg, crs = 4326)
+# EJ dataset
+mt_ej = ej %>%
+  filter(STATE == 'Montana')
+
+# Join ej data to shapefile
+mt_cbg_ej <- mt_cbg %>% 
+  left_join(mt_ej, by=c('GEOID' = 'GEOID_12')) %>%
+  mutate(POP_DENSITY = POP / ALAND)
+
+# Wells
+mt_wells = wells %>%
+  filter(wells$state == 'Montana')
+
+# CBG polygons contain points
+mt_cbg_ej_wells <- st_join(mt_wells, mt_cbg_ej)
+
+# make summary df
+agg_tbl <- mt_cbg_ej_wells %>% 
+  group_by(GEOID) %>% 
+  summarise(Orphaned=n(),
+            .groups = 'drop')
+```
+
+# Montana doesn't have plugged wells
+
+```{r montana unplugged}
+# Select MT unplugged wells
+mt_unplugged <- all_wells_shp %>%
+  filter(stusps == 'MT' & ft_category != 'Plugged')
+
+# Loop over the dataset in chunks of 5000 rows
+results_list2 <- list()
+
+for (i in seq(1, nrow(mt_unplugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- mt_unplugged[i:min(i + chunk_size - 1, nrow(mt_unplugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, mt_cbg)
+  
+  # Append result to the list
+  results_list2[[length(results_list2) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(mt_unplugged))))
+}
+
+# Combine all chunks into a single dataframe
+mt_unplugged_shp <- do.call(rbind, results_list2)
+```
+
+```{r mt summary}
+# make summary df
+agg_tbl3 <- mt_unplugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Unplugged=n(),
+            .groups = 'drop') 
+
+# Merge summarized well counts back with the original al_cbg_ej data
+mt_hauser <- mt_cbg_ej %>%
+  st_join(agg_tbl) %>%
+  st_join(agg_tbl3) %>%
+  replace_na(list(Orphaned = 0)) %>%
+  replace_na(list(Unplugged = 0)) %>%
+  # Make column for plugged
+  add_column(Plugged = 0) %>%
+  subset(select = -c(GEOID.y, GEOID)) %>%
+  #rename(GEOID = GEOID.x) %>%
+  # Define sample: drop rows where orphaned, plugged, and unplugged are all 0
+  filter(!(Orphaned == 0 & Plugged == 0 & Unplugged == 0)) %>%
+  st_drop_geometry()
+
+mt_hauser <- mt_hauser %>%
+  rename(GEOID = GEOID.x)
+
+#### SAVE FILE
+write.csv(mt_hauser,
+          "/Users/gracehauser/Desktop/Publication/Results/EJ_state_summaries/MT.csv",
+          na = "")
+```
+
+#########################################
+# Nebraska
+#########################################
+
+```{r nebraska}
+# CBG shapefile
+ne_cbg <- block_groups(state = 'NE', year = 2021, class = "sf")
+# Convert CRS to WGS84
+ne_cbg <- st_transform(ne_cbg, crs = 4326)
+# EJ dataset
+ne_ej = ej %>%
+  filter(STATE == 'Nebraska')
+
+# Join ej data to shapefile
+ne_cbg_ej <- ne_cbg %>% 
+  left_join(ne_ej, by=c('GEOID' = 'GEOID_12')) %>%
+  mutate(POP_DENSITY = POP / ALAND)
+
+# Wells
+ne_wells = wells %>%
+  filter(wells$state == 'Nebraska')
+
+# CBG polygons contain points
+ne_cbg_ej_wells <- st_join(ne_wells, ne_cbg_ej)
+
+# make summary df
+agg_tbl <- ne_cbg_ej_wells %>% 
+  group_by(GEOID) %>% 
+  summarise(Orphaned=n(),
+            .groups = 'drop')
+```
+
+```{r nebraska plugged}
+# Select NE plugged wells
+ne_plugged <- all_wells_shp %>%
+  filter(stusps == 'NE' & ft_category == 'Plugged')
+
+# Define chunk size
+chunk_size <- 5000
+
+# Create an empty list to store results
+results_list <- list()
+
+# Loop over the dataset in chunks of 100 rows
+for (i in seq(1, nrow(ne_plugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- ne_plugged[i:min(i + chunk_size - 1, nrow(ne_plugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, ne_cbg, left = FALSE)
+  
+  # Append result to the list
+  results_list[[length(results_list) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(ne_plugged))))
+}
+
+# Combine all chunks into a single dataframe
+ne_plugged_shp <- do.call(rbind, results_list)
+
+```
+
+```{r nebraska unplugged}
+# Select NE unplugged wells
+ne_unplugged <- all_wells_shp %>%
+  filter(stusps == 'NE' & ft_category != 'Plugged')
+
+# Loop over the dataset in chunks of 5000 rows
+results_list2 <- list()
+
+for (i in seq(1, nrow(ne_unplugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- ne_unplugged[i:min(i + chunk_size - 1, nrow(ne_unplugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, ne_cbg)
+  
+  # Append result to the list
+  results_list2[[length(results_list2) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(ne_unplugged))))
+}
+
+# Combine all chunks into a single dataframe
+ne_unplugged_shp <- do.call(rbind, results_list2)
+```
+
+```{r ne summary}
+# make summary df
+agg_tbl2 <- ne_plugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Plugged=n(),
+            .groups = 'drop') 
+# make summary df
+agg_tbl3 <- ne_unplugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Unplugged=n(),
+            .groups = 'drop') 
+
+# Merge summarized well counts back with the original al_cbg_ej data
+ne_hauser <- ne_cbg_ej %>%
+  st_join(agg_tbl) %>%
+  st_join(agg_tbl2) %>%
+  st_join(agg_tbl3) %>%
+  replace_na(list(Orphaned = 0)) %>%
+  replace_na(list(Plugged = 0)) %>%
+  replace_na(list(Unplugged = 0)) %>%
+  rename(GEOID = GEOID.x) %>%
+  subset(select = -c(GEOID.y, GEOID.x.1, GEOID.y.1)) %>%
+  # Define sample: drop rows where orphaned, plugged, and unplugged are all 0
+  filter(!(Orphaned == 0 & Plugged == 0 & Unplugged == 0)) %>%
+  st_drop_geometry()
+
+#### SAVE FILE
+write.csv(ne_hauser,
+          "/Users/gracehauser/Desktop/Publication/Results/EJ_state_summaries/NE.csv",
+          na = "")
+```
+
+#########################################
+# Nevada
+#########################################
+
+```{r nevada}
+# CBG shapefile
+nv_cbg <- block_groups(state = 'NV', year = 2021, class = "sf")
+# Convert CRS to WGS84
+nv_cbg <- st_transform(nv_cbg, crs = 4326)
+# EJ dataset
+nv_ej = ej %>%
+  filter(STATE == 'Nevada')
+
+# Join ej data to shapefile
+nv_cbg_ej <- nv_cbg %>% 
+  left_join(nv_ej, by=c('GEOID' = 'GEOID_12')) %>%
+  mutate(POP_DENSITY = POP / ALAND)
+
+# Wells
+nv_wells = wells %>%
+  filter(wells$state == 'Nevada')
+
+# CBG polygons contain points
+nv_cbg_ej_wells <- st_join(nv_wells, nv_cbg_ej)
+
+# make summary df
+agg_tbl <- nv_cbg_ej_wells %>% 
+  group_by(GEOID) %>% 
+  summarise(Orphaned=n(),
+            .groups = 'drop')
+```
+
+```{r nevada plugged}
+# Select NV plugged wells
+nv_plugged <- all_wells_shp %>%
+  filter(stusps == 'NV' & ft_category == 'Plugged')
+
+# Define chunk size
+chunk_size <- 5000
+
+# Create an empty list to store results
+results_list <- list()
+
+# Loop over the dataset in chunks of 100 rows
+for (i in seq(1, nrow(nv_plugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- nv_plugged[i:min(i + chunk_size - 1, nrow(nv_plugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, nv_cbg, left = FALSE)
+  
+  # Append result to the list
+  results_list[[length(results_list) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(nv_plugged))))
+}
+
+# Combine all chunks into a single dataframe
+nv_plugged_shp <- do.call(rbind, results_list)
+
+```
+
+```{r nevada unplugged}
+# Select NV unplugged wells
+nv_unplugged <- all_wells_shp %>%
+  filter(stusps == 'NV' & ft_category != 'Plugged')
+
+# Loop over the dataset in chunks of 5000 rows
+results_list2 <- list()
+
+for (i in seq(1, nrow(nv_unplugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- nv_unplugged[i:min(i + chunk_size - 1, nrow(nv_unplugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, nv_cbg)
+  
+  # Append result to the list
+  results_list2[[length(results_list2) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(nv_unplugged))))
+}
+
+# Combine all chunks into a single dataframe
+nv_unplugged_shp <- do.call(rbind, results_list2)
+
+```
+
+```{r nv summary}
+# make summary df
+agg_tbl2 <- nv_plugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Plugged=n(),
+            .groups = 'drop') 
+# make summary df
+agg_tbl3 <- nv_unplugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Unplugged=n(),
+            .groups = 'drop') 
+
+# Merge summarized well counts back with the original al_cbg_ej data
+nv_hauser <- nv_cbg_ej %>%
+  st_join(agg_tbl) %>%
+  st_join(agg_tbl2) %>%
+  st_join(agg_tbl3) %>%
+  replace_na(list(Orphaned = 0)) %>%
+  replace_na(list(Plugged = 0)) %>%
+  replace_na(list(Unplugged = 0)) %>%
+  rename(GEOID = GEOID.x) %>%
+  subset(select = -c(GEOID.y, GEOID.x.1, GEOID.y.1)) %>%
+  # Define sample: drop rows where orphaned, plugged, and unplugged are all 0
+  filter(!(Orphaned == 0 & Plugged == 0 & Unplugged == 0)) %>%
+  st_drop_geometry()
+
+#### SAVE FILE
+write.csv(nv_hauser,
+          "/Users/gracehauser/Desktop/Publication/Results/EJ_state_summaries/NV.csv",
+          na = "")
+```
+
+#########################################
+# New Mexico
+#########################################
+
+```{r new mexico}
+# CBG shapefile
+nm_cbg <- block_groups(state = 'NM', year = 2021, class = "sf")
+# Convert CRS to WGS84
+nm_cbg <- st_transform(nm_cbg, crs = 4326)
+# EJ dataset
+nm_ej = ej %>%
+  filter(STATE == 'New Mexico')
+
+# Join ej data to shapefile
+nm_cbg_ej <- nm_cbg %>% 
+  left_join(nm_ej, by=c('GEOID' = 'GEOID_12')) %>%
+  mutate(POP_DENSITY = POP / ALAND)
+
+# Wells
+nm_wells = wells %>%
+  filter(wells$state == 'New Mexico')
+
+# CBG polygons contain points
+nm_cbg_ej_wells <- st_join(nm_wells, nm_cbg_ej)
+
+# make summary df
+agg_tbl <- nm_cbg_ej_wells %>% 
+  group_by(GEOID) %>% 
+  summarise(Orphaned=n(),
+            .groups = 'drop')
+```
+
+```{r new meixco plugged}
+# Select NM plugged wells
+nm_plugged <- all_wells_shp %>%
+  filter(stusps == 'NM' & ft_category == 'Plugged')
+
+# Define chunk size
+chunk_size <- 5000
+
+# Create an empty list to store results
+results_list <- list()
+
+# Loop over the dataset in chunks of 100 rows
+for (i in seq(1, nrow(nm_plugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- nm_plugged[i:min(i + chunk_size - 1, nrow(nm_plugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, nm_cbg, left = FALSE)
+  
+  # Append result to the list
+  results_list[[length(results_list) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(nm_plugged))))
+}
+
+# Combine all chunks into a single dataframe
+nm_plugged_shp <- do.call(rbind, results_list)
+
+```
+
+```{r new mexico unplugged}
+# Select NM unplugged wells
+nm_unplugged <- all_wells_shp %>%
+  filter(stusps == 'NM' & ft_category != 'Plugged')
+
+# Loop over the dataset in chunks of 5000 rows
+results_list2 <- list()
+
+for (i in seq(1, nrow(nm_unplugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- nm_unplugged[i:min(i + chunk_size - 1, nrow(nm_unplugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, nm_cbg)
+  
+  # Append result to the list
+  results_list2[[length(results_list2) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(nm_unplugged))))
+}
+
+# Combine all chunks into a single dataframe
+nm_unplugged_shp <- do.call(rbind, results_list2)
+
+```
+
+```{r nm summary}
+# make summary df
+agg_tbl2 <- nm_plugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Plugged=n(),
+            .groups = 'drop') 
+# make summary df
+agg_tbl3 <- nm_unplugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Unplugged=n(),
+            .groups = 'drop') 
+
+# Merge summarized well counts back with the original al_cbg_ej data
+nm_hauser <- nm_cbg_ej %>%
+  st_join(agg_tbl) %>%
+  st_join(agg_tbl2) %>%
+  st_join(agg_tbl3) %>%
+  replace_na(list(Orphaned = 0)) %>%
+  replace_na(list(Plugged = 0)) %>%
+  replace_na(list(Unplugged = 0)) %>%
+  rename(GEOID = GEOID.x) %>%
+  subset(select = -c(GEOID.y, GEOID.x.1, GEOID.y.1)) %>%
+  # Define sample: drop rows where orphaned, plugged, and unplugged are all 0
+  filter(!(Orphaned == 0 & Plugged == 0 & Unplugged == 0)) %>%
+  st_drop_geometry()
+
+#### SAVE FILE
+write.csv(nm_hauser,
+          "/Users/gracehauser/Desktop/Publication/Results/EJ_state_summaries/NM.csv",
+          na = "")
+```
+
+#########################################
+# New York
+#########################################
+
+```{r new york}
+# CBG shapefile
+ny_cbg <- block_groups(state = 'NY', year = 2021, class = "sf")
+# Convert CRS to WGS84
+ny_cbg <- st_transform(ny_cbg, crs = 4326)
+# EJ dataset
+ny_ej = ej %>%
+  filter(STATE == 'New York')
+
+# Join ej data to shapefile
+ny_cbg_ej <- ny_cbg %>% 
+  left_join(ny_ej, by=c('GEOID' = 'GEOID_12')) %>%
+  mutate(POP_DENSITY = POP / ALAND)
+
+# Wells
+ny_wells = wells %>%
+  filter(wells$state == 'New York')
+
+# CBG polygons contain points
+ny_cbg_ej_wells <- st_join(ny_wells, ny_cbg_ej)
+
+# make summary df
+agg_tbl <- ny_cbg_ej_wells %>% 
+  group_by(GEOID) %>% 
+  summarise(Orphaned=n(),
+            .groups = 'drop')
+```
+
+```{r new york plugged}
+# Select NY plugged wells
+ny_plugged <- all_wells_shp %>%
+  filter(stusps == 'NY' & ft_category == 'Plugged')
+
+# Define chunk size
+chunk_size <- 5000
+
+# Create an empty list to store results
+results_list <- list()
+
+# Loop over the dataset in chunks of 100 rows
+for (i in seq(1, nrow(ny_plugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- ny_plugged[i:min(i + chunk_size - 1, nrow(ny_plugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, ny_cbg, left = FALSE)
+  
+  # Append result to the list
+  results_list[[length(results_list) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(ny_plugged))))
+}
+
+# Combine all chunks into a single dataframe
+ny_plugged_shp <- do.call(rbind, results_list)
+
+```
+
+```{r new york unplugged}
+# Select NY unplugged wells
+ny_unplugged <- all_wells_shp %>%
+  filter(stusps == 'NY' & ft_category != 'Plugged')
+
+# Loop over the dataset in chunks of 5000 rows
+results_list2 <- list()
+
+for (i in seq(1, nrow(ny_unplugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- ny_unplugged[i:min(i + chunk_size - 1, nrow(ny_unplugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, ny_cbg)
+  
+  # Append result to the list
+  results_list2[[length(results_list2) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(ny_unplugged))))
+}
+
+# Combine all chunks into a single dataframe
+ny_unplugged_shp <- do.call(rbind, results_list2)
+
+```
+
+```{r ny summary}
+# make summary df
+agg_tbl2 <- ny_plugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Plugged=n(),
+            .groups = 'drop') 
+# make summary df
+agg_tbl3 <- ny_unplugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Unplugged=n(),
+            .groups = 'drop') 
+
+# Merge summarized well counts back with the original al_cbg_ej data
+ny_hauser <- ny_cbg_ej %>%
+  st_join(agg_tbl) %>%
+  st_join(agg_tbl2) %>%
+  st_join(agg_tbl3) %>%
+  replace_na(list(Orphaned = 0)) %>%
+  replace_na(list(Plugged = 0)) %>%
+  replace_na(list(Unplugged = 0)) %>%
+  rename(GEOID = GEOID.x) %>%
+  subset(select = -c(GEOID.y, GEOID.x.1, GEOID.y.1)) %>%
+  # Define sample: drop rows where orphaned, plugged, and unplugged are all 0
+  filter(!(Orphaned == 0 & Plugged == 0 & Unplugged == 0)) %>%
+  st_drop_geometry()
+
+#### SAVE FILE
+write.csv(ny_hauser,
+          "/Users/gracehauser/Desktop/Publication/Results/EJ_state_summaries/NY.csv",
+          na = "")
+```
+
+#########################################
+# North Dakota
+#########################################
+
+```{r north dakota}
+# CBG shapefile
+nd_cbg <- block_groups(state = 'ND', year = 2021, class = "sf")
+# Convert CRS to WGS84
+nd_cbg <- st_transform(nd_cbg, crs = 4326)
+# EJ dataset
+nd_ej = ej %>%
+  filter(STATE == 'North Dakota')
+
+# Join ej data to shapefile
+nd_cbg_ej <- nd_cbg %>% 
+  left_join(nd_ej, by=c('GEOID' = 'GEOID_12')) %>%
+  mutate(POP_DENSITY = POP / ALAND)
+
+# Wells
+nd_wells = wells %>%
+  filter(wells$state == 'North Dakota')
+
+# CBG polygons contain points
+nd_cbg_ej_wells <- st_join(nd_wells, nd_cbg_ej)
+
+# make summary df
+agg_tbl <- nd_cbg_ej_wells %>% 
+  group_by(GEOID) %>% 
+  summarise(Orphaned=n(),
+            .groups = 'drop')
+```
+
+# North Dakota has no plugged wells
+
+```{r north dakota unplugged}
+# Select ND unplugged wells
+nd_unplugged <- all_wells_shp %>%
+  filter(stusps == 'ND' & ft_category != 'Plugged')
+
+# Loop over the dataset in chunks of 5000 rows
+results_list2 <- list()
+
+for (i in seq(1, nrow(nd_unplugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- nd_unplugged[i:min(i + chunk_size - 1, nrow(nd_unplugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, nd_cbg)
+  
+  # Append result to the list
+  results_list2[[length(results_list2) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(nd_unplugged))))
+}
+
+# Combine all chunks into a single dataframe
+nd_unplugged_shp <- do.call(rbind, results_list2)
+
+```
+
+```{r nd summary}
+# make summary df
+agg_tbl3 <- nd_unplugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Unplugged=n(),
+            .groups = 'drop') 
+
+# Merge summarized well counts back with the original al_cbg_ej data
+nd_hauser <- nd_cbg_ej %>%
+  st_join(agg_tbl) %>%
+  st_join(agg_tbl3) %>%
+  replace_na(list(Orphaned = 0)) %>%
+  replace_na(list(Unplugged = 0)) %>%
+  # Make column for plugged
+  add_column(Plugged = 0) %>%
+  subset(select = -c(GEOID.y, GEOID)) %>%
+  #rename(GEOID = GEOID.x) %>%
+  # Define sample: drop rows where orphaned, plugged, and unplugged are all 0
+  filter(!(Orphaned == 0 & Plugged == 0 & Unplugged == 0)) %>%
+  st_drop_geometry()
+
+nd_hauser <- nd_hauser %>%
+  rename(GEOID = GEOID.x)
+
+#### SAVE FILE
+write.csv(nd_hauser,
+          "/Users/gracehauser/Desktop/Publication/Results/EJ_state_summaries/ND.csv",
+          na = "")
+```
+
+#########################################
+# Ohio
+#########################################
+
+```{r ohio}
+# CBG shapefile
+oh_cbg <- block_groups(state = 'OH', year = 2021, class = "sf")
+# Convert CRS to WGS84
+oh_cbg <- st_transform(oh_cbg, crs = 4326)
+# EJ dataset
+oh_ej = ej %>%
+  filter(STATE == 'Ohio')
+
+# Join ej data to shapefile
+oh_cbg_ej <- oh_cbg %>% 
+  left_join(oh_ej, by=c('GEOID' = 'GEOID_12')) %>%
+  mutate(POP_DENSITY = POP / ALAND)
+
+# Wells
+oh_wells = wells %>%
+  filter(wells$state == 'Ohio')
+
+# CBG polygons contain points
+oh_cbg_ej_wells <- st_join(oh_wells, oh_cbg_ej)
+
+# make summary df
+agg_tbl <- oh_cbg_ej_wells %>% 
+  group_by(GEOID) %>% 
+  summarise(Orphaned=n(),
+            .groups = 'drop')
+```
+
+```{r ohio plugged}
+# Select OH plugged wells
+oh_plugged <- all_wells_shp %>%
+  filter(stusps == 'OH' & ft_category == 'Plugged')
+
+# Define chunk size
+chunk_size <- 5000
+
+# Create an empty list to store results
+results_list <- list()
+
+# Loop over the dataset in chunks of 100 rows
+for (i in seq(1, nrow(oh_plugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- oh_plugged[i:min(i + chunk_size - 1, nrow(oh_plugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, oh_cbg, left = FALSE)
+  
+  # Append result to the list
+  results_list[[length(results_list) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(oh_plugged))))
+}
+
+# Combine all chunks into a single dataframe
+oh_plugged_shp <- do.call(rbind, results_list)
+
+```
+
+```{r ohio unplugged}
+# Select OH unplugged wells
+oh_unplugged <- all_wells_shp %>%
+  filter(stusps == 'OH' & ft_category != 'Plugged')
+
+# Loop over the dataset in chunks of 5000 rows
+results_list2 <- list()
+
+for (i in seq(1, nrow(oh_unplugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- oh_unplugged[i:min(i + chunk_size - 1, nrow(oh_unplugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, oh_cbg)
+  
+  # Append result to the list
+  results_list2[[length(results_list2) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(oh_unplugged))))
+}
+
+# Combine all chunks into a single dataframe
+oh_unplugged_shp <- do.call(rbind, results_list2)
+
+```
+
+```{r oh summary}
+# make summary df
+agg_tbl2 <- oh_plugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Plugged=n(),
+            .groups = 'drop') 
+# make summary df
+agg_tbl3 <- oh_unplugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Unplugged=n(),
+            .groups = 'drop') 
+
+# Merge summarized well counts back with the original al_cbg_ej data
+oh_hauser <- oh_cbg_ej %>%
+  st_join(agg_tbl) %>%
+  st_join(agg_tbl2) %>%
+  st_join(agg_tbl3) %>%
+  replace_na(list(Orphaned = 0)) %>%
+  replace_na(list(Plugged = 0)) %>%
+  replace_na(list(Unplugged = 0)) %>%
+  rename(GEOID = GEOID.x) %>%
+  subset(select = -c(GEOID.y, GEOID.x.1, GEOID.y.1)) %>%
+  # Define sample: drop rows where orphaned, plugged, and unplugged are all 0
+  filter(!(Orphaned == 0 & Plugged == 0 & Unplugged == 0)) %>%
+  st_drop_geometry()
+
+#### SAVE FILE
+write.csv(oh_hauser,
+          "/Users/gracehauser/Desktop/Publication/Results/EJ_state_summaries/OH.csv",
+          na = "")
+```
+
+#########################################
+# Oklahoma
+#########################################
+
+```{r oklahoma}
+# CBG shapefile
+ok_cbg <- block_groups(state = 'OK', year = 2021, class = "sf")
+# Convert CRS to WGS84
+ok_cbg <- st_transform(ok_cbg, crs = 4326)
+# EJ dataset
+ok_ej = ej %>%
+  filter(STATE == 'Oklahoma')
+
+# Join ej data to shapefile
+ok_cbg_ej <- ok_cbg %>% 
+  left_join(ok_ej, by=c('GEOID' = 'GEOID_12')) %>%
+  mutate(POP_DENSITY = POP / ALAND)
+
+# Wells
+ok_wells = wells %>%
+  filter(wells$state == 'Oklahoma')
+
+# CBG polygons contain points
+ok_cbg_ej_wells <- st_join(ok_wells, ok_cbg_ej)
+
+# make summary df
+agg_tbl <- ok_cbg_ej_wells %>% 
+  group_by(GEOID) %>% 
+  summarise(Orphaned=n(),
+            .groups = 'drop')
+```
+
+```{r oklahoma plugged}
+# Select OH plugged wells
+ok_plugged <- all_wells_shp %>%
+  filter(stusps == 'OK' & ft_category == 'Plugged')
+
+# Define chunk size
+chunk_size <- 5000
+
+# Create an empty list to store results
+results_list <- list()
+
+# Loop over the dataset in chunks of 100 rows
+for (i in seq(1, nrow(ok_plugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- ok_plugged[i:min(i + chunk_size - 1, nrow(ok_plugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, ok_cbg, left = FALSE)
+  
+  # Append result to the list
+  results_list[[length(results_list) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(ok_plugged))))
+}
+
+# Combine all chunks into a single dataframe
+ok_plugged_shp <- do.call(rbind, results_list)
+
+```
+
+```{r oklahoma unplugged}
+# Select OK unplugged wells
+ok_unplugged <- all_wells_shp %>%
+  filter(stusps == 'OK' & ft_category != 'Plugged')
+
+# Loop over the dataset in chunks of 5000 rows
+results_list2 <- list()
+
+for (i in seq(1, nrow(ok_unplugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- ok_unplugged[i:min(i + chunk_size - 1, nrow(ok_unplugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, ok_cbg)
+  
+  # Append result to the list
+  results_list2[[length(results_list2) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(ok_unplugged))))
+}
+
+# Combine all chunks into a single dataframe
+ok_unplugged_shp <- do.call(rbind, results_list2)
+
+```
+
+```{r ok summary}
+# make summary df
+agg_tbl2 <- ok_plugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Plugged=n(),
+            .groups = 'drop') 
+# make summary df
+agg_tbl3 <- ok_unplugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Unplugged=n(),
+            .groups = 'drop') 
+
+# Merge summarized well counts back with the original al_cbg_ej data
+ok_hauser <- ok_cbg_ej %>%
+  st_join(agg_tbl) %>%
+  st_join(agg_tbl2) %>%
+  st_join(agg_tbl3) %>%
+  replace_na(list(Orphaned = 0)) %>%
+  replace_na(list(Plugged = 0)) %>%
+  replace_na(list(Unplugged = 0)) %>%
+  rename(GEOID = GEOID.x) %>%
+  subset(select = -c(GEOID.y, GEOID.x.1, GEOID.y.1)) %>%
+  # Define sample: drop rows where orphaned, plugged, and unplugged are all 0
+  filter(!(Orphaned == 0 & Plugged == 0 & Unplugged == 0)) %>%
+  st_drop_geometry()
+
+#### SAVE FILE
+write.csv(ok_hauser,
+          "/Users/gracehauser/Desktop/Publication/Results/EJ_state_summaries/OK.csv",
+          na = "")
+```
+
+#########################################
+# Pennsylvania
+#########################################
+
+```{r penn}
+# CBG shapefile
+pa_cbg <- block_groups(state = 'PA', year = 2021, class = "sf")
+# Convert CRS to WGS84
+pa_cbg <- st_transform(pa_cbg, crs = 4326)
+# EJ dataset
+pa_ej = ej %>%
+  filter(STATE == 'Pennsylvania')
+
+# Join ej data to shapefile
+pa_cbg_ej <- pa_cbg %>% 
+  left_join(pa_ej, by=c('GEOID' = 'GEOID_12')) %>%
+  mutate(POP_DENSITY = POP / ALAND)
+
+# Wells
+pa_wells = wells %>%
+  filter(wells$state == 'Pennsylvania')
+
+# CBG polygons contain points
+pa_cbg_ej_wells <- st_join(pa_wells, pa_cbg_ej)
+
+# make summary df
+agg_tbl <- pa_cbg_ej_wells %>% 
+  group_by(GEOID) %>% 
+  summarise(Orphaned=n(),
+            .groups = 'drop')
+```
+
+```{r penn plugged}
+# Select PA plugged wells
+pa_plugged <- all_wells_shp %>%
+  filter(stusps == 'PA' & ft_category == 'Plugged')
+
+# Define chunk size
+chunk_size <- 5000
+
+# Create an empty list to store results
+results_list <- list()
+
+# Loop over the dataset in chunks of 100 rows
+for (i in seq(1, nrow(pa_plugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- pa_plugged[i:min(i + chunk_size - 1, nrow(pa_plugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, pa_cbg, left = FALSE)
+  
+  # Append result to the list
+  results_list[[length(results_list) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(pa_plugged))))
+}
+
+# Combine all chunks into a single dataframe
+pa_plugged_shp <- do.call(rbind, results_list)
+
+```
+
+```{r penn unplugged}
+# Select PA unplugged wells
+pa_unplugged <- all_wells_shp %>%
+  filter(stusps == 'PA' & ft_category != 'Plugged')
+
+# Loop over the dataset in chunks of 5000 rows
+results_list2 <- list()
+
+for (i in seq(1, nrow(pa_unplugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- pa_unplugged[i:min(i + chunk_size - 1, nrow(pa_unplugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, pa_cbg)
+  
+  # Append result to the list
+  results_list2[[length(results_list2) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(pa_unplugged))))
+}
+
+# Combine all chunks into a single dataframe
+pa_unplugged_shp <- do.call(rbind, results_list2)
+
+```
+
+```{r pa summary}
+# make summary df
+agg_tbl2 <- pa_plugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Plugged=n(),
+            .groups = 'drop') 
+# make summary df
+agg_tbl3 <- pa_unplugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Unplugged=n(),
+            .groups = 'drop') 
+
+# Merge summarized well counts back with the original al_cbg_ej data
+pa_hauser <- pa_cbg_ej %>%
+  st_join(agg_tbl) %>%
+  st_join(agg_tbl2) %>%
+  st_join(agg_tbl3) %>%
+  replace_na(list(Orphaned = 0)) %>%
+  replace_na(list(Plugged = 0)) %>%
+  replace_na(list(Unplugged = 0)) %>%
+  rename(GEOID = GEOID.x) %>%
+  subset(select = -c(GEOID.y, GEOID.x.1, GEOID.y.1)) %>%
+  # Define sample: drop rows where orphaned, plugged, and unplugged are all 0
+  filter(!(Orphaned == 0 & Plugged == 0 & Unplugged == 0)) %>%
+  st_drop_geometry()
+
+#### SAVE FILE
+write.csv(pa_hauser,
+          "/Users/gracehauser/Desktop/Publication/Results/EJ_state_summaries/PA.csv",
+          na = "")
+```
+
+#########################################
+# Southa Dakota
+#########################################
+
+```{r south dakota}
+# CBG shapefile
+sd_cbg <- block_groups(state = 'SD', year = 2021, class = "sf")
+# Convert CRS to WGS84
+sd_cbg <- st_transform(sd_cbg, crs = 4326)
+# EJ dataset
+sd_ej = ej %>%
+  filter(STATE == 'South Dakota')
+
+# Join ej data to shapefile
+sd_cbg_ej <- sd_cbg %>% 
+  left_join(sd_ej, by=c('GEOID' = 'GEOID_12')) %>%
+  mutate(POP_DENSITY = POP / ALAND)
+
+# Wells
+sd_wells = wells %>%
+  filter(wells$state == 'South Dakota')
+
+# CBG polygons contain points
+sd_cbg_ej_wells <- st_join(sd_wells, sd_cbg_ej)
+
+# make summary df
+agg_tbl <- sd_cbg_ej_wells %>% 
+  group_by(GEOID) %>% 
+  summarise(Orphaned=n(),
+            .groups = 'drop')
+```
+
+```{r south dakota plugged}
+# Select SD plugged wells
+sd_plugged <- all_wells_shp %>%
+  filter(stusps == 'SD' & ft_category == 'Plugged')
+
+# Define chunk size
+chunk_size <- 5000
+
+# Create an empty list to store results
+results_list <- list()
+
+# Loop over the dataset in chunks of 100 rows
+for (i in seq(1, nrow(sd_plugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- sd_plugged[i:min(i + chunk_size - 1, nrow(sd_plugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, sd_cbg, left = FALSE)
+  
+  # Append result to the list
+  results_list[[length(results_list) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(sd_plugged))))
+}
+
+# Combine all chunks into a single dataframe
+sd_plugged_shp <- do.call(rbind, results_list)
+
+```
+
+```{r south dakota unplugged}
+# Select SD unplugged wells
+sd_unplugged <- all_wells_shp %>%
+  filter(stusps == 'SD' & ft_category != 'Plugged')
+
+# Loop over the dataset in chunks of 5000 rows
+results_list2 <- list()
+
+for (i in seq(1, nrow(sd_unplugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- sd_unplugged[i:min(i + chunk_size - 1, nrow(sd_unplugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, sd_cbg)
+  
+  # Append result to the list
+  results_list2[[length(results_list2) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(sd_unplugged))))
+}
+
+# Combine all chunks into a single dataframe
+sd_unplugged_shp <- do.call(rbind, results_list2)
+
+```
+
+```{r sd summary}
+# make summary df
+agg_tbl2 <- sd_plugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Plugged=n(),
+            .groups = 'drop') 
+# make summary df
+agg_tbl3 <- sd_unplugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Unplugged=n(),
+            .groups = 'drop') 
+
+# Merge summarized well counts back with the original al_cbg_ej data
+sd_hauser <- sd_cbg_ej %>%
+  st_join(agg_tbl) %>%
+  st_join(agg_tbl2) %>%
+  st_join(agg_tbl3) %>%
+  replace_na(list(Orphaned = 0)) %>%
+  replace_na(list(Plugged = 0)) %>%
+  replace_na(list(Unplugged = 0)) %>%
+  rename(GEOID = GEOID.x) %>%
+  subset(select = -c(GEOID.y, GEOID.x.1, GEOID.y.1)) %>%
+  # Define sample: drop rows where orphaned, plugged, and unplugged are all 0
+  filter(!(Orphaned == 0 & Plugged == 0 & Unplugged == 0)) %>%
+  st_drop_geometry()
+
+#### SAVE FILE
+write.csv(sd_hauser,
+          "/Users/gracehauser/Desktop/Publication/Results/EJ_state_summaries/SD.csv",
+          na = "")
+```
+
+#########################################
+# Tennessee
+#########################################
+
+```{r tennessee}
+# CBG shapefile
+tn_cbg <- block_groups(state = 'TN', year = 2021, class = "sf")
+# Convert CRS to WGS84
+tn_cbg <- st_transform(tn_cbg, crs = 4326)
+# EJ dataset
+tn_ej = ej %>%
+  filter(STATE == 'Tennessee')
+
+# Join ej data to shapefile
+tn_cbg_ej <- tn_cbg %>% 
+  left_join(tn_ej, by=c('GEOID' = 'GEOID_12')) %>%
+  mutate(POP_DENSITY = POP / ALAND)
+
+# Wells
+tn_wells = wells %>%
+  filter(wells$state == 'Tennessee')
+
+# CBG polygons contain points
+tn_cbg_ej_wells <- st_join(tn_wells, tn_cbg_ej)
+
+# make summary df
+agg_tbl <- tn_cbg_ej_wells %>% 
+  group_by(GEOID) %>% 
+  summarise(Orphaned=n(),
+            .groups = 'drop')
+```
+
+# Tennessee has no plugged wells
+
+```{r tennessee unplugged}
+# Select TN unplugged wells
+tn_unplugged <- all_wells_shp %>%
+  filter(stusps == 'TN' & ft_category != 'Plugged')
+
+# Loop over the dataset in chunks of 5000 rows
+results_list2 <- list()
+
+for (i in seq(1, nrow(tn_unplugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- tn_unplugged[i:min(i + chunk_size - 1, nrow(tn_unplugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, tn_cbg)
+  
+  # Append result to the list
+  results_list2[[length(results_list2) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(tn_unplugged))))
+}
+
+# Combine all chunks into a single dataframe
+tn_unplugged_shp <- do.call(rbind, results_list2)
+
+```
+
+```{r tn summary}
+# make summary df
+agg_tbl3 <- tn_unplugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Unplugged=n(),
+            .groups = 'drop') 
+
+# Merge summarized well counts back with the original al_cbg_ej data
+tn_hauser <- tn_cbg_ej %>%
+  st_join(agg_tbl) %>%
+  st_join(agg_tbl3) %>%
+  replace_na(list(Orphaned = 0)) %>%
+  replace_na(list(Unplugged = 0)) %>%
+  # Make column for plugged
+  add_column(Plugged = 0) %>%
+  subset(select = -c(GEOID.y, GEOID)) %>%
+  #rename(GEOID = GEOID.x) %>%
+  # Define sample: drop rows where orphaned, plugged, and unplugged are all 0
+  filter(!(Orphaned == 0 & Plugged == 0 & Unplugged == 0)) %>%
+  st_drop_geometry()
+
+tn_hauser <- tn_hauser %>%
+  rename(GEOID = GEOID.x)
+
+#### SAVE FILE
+write.csv(tn_hauser,
+          "/Users/gracehauser/Desktop/Publication/Results/EJ_state_summaries/TN.csv",
+          na = "")
+```
+
+#########################################
+# Texas
+#########################################
+
+```{r texas}
+# CBG shapefile
+tx_cbg <- block_groups(state = 'TX', year = 2021, class = "sf")
+# Convert CRS to WGS84
+tx_cbg <- st_transform(tx_cbg, crs = 4326)
+# EJ dataset
+tx_ej = ej %>%
+  filter(STATE == 'Texas')
+
+# Join ej data to shapefile
+tx_cbg_ej <- tx_cbg %>% 
+  left_join(tx_ej, by=c('GEOID' = 'GEOID_12')) %>%
+  mutate(POP_DENSITY = POP / ALAND)
+
+# Wells
+tx_wells = wells %>%
+  filter(wells$state == 'Texas')
+
+# CBG polygons contain points
+tx_cbg_ej_wells <- st_join(tx_wells, tx_cbg_ej)
+
+# make summary df
+agg_tbl <- tx_cbg_ej_wells %>% 
+  group_by(GEOID) %>% 
+  summarise(Orphaned=n(),
+            .groups = 'drop')
+```
+
+```{r texas plugged}
+# Select TX plugged wells
+tx_plugged <- all_wells_shp %>%
+  filter(stusps == 'TX' & ft_category == 'Plugged')
+
+# Define chunk size
+chunk_size <- 5000
+
+# Create an empty list to store results
+results_list <- list()
+
+# Loop over the dataset in chunks of 100 rows
+for (i in seq(1, nrow(tx_plugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- tx_plugged[i:min(i + chunk_size - 1, nrow(tx_plugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, tx_cbg, left = FALSE)
+  
+  # Append result to the list
+  results_list[[length(results_list) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(tx_plugged))))
+}
+
+# Combine all chunks into a single dataframe
+tx_plugged_shp <- do.call(rbind, results_list)
+
+```
+
+```{r texas unplugged}
+# Select TX unplugged wells
+tx_unplugged <- all_wells_shp %>%
+  filter(stusps == 'TX' & ft_category != 'Plugged')
+
+# Loop over the dataset in chunks of 5000 rows
+results_list2 <- list()
+
+for (i in seq(1, nrow(tx_unplugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- tx_unplugged[i:min(i + chunk_size - 1, nrow(tx_unplugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, tx_cbg)
+  
+  # Append result to the list
+  results_list2[[length(results_list2) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(tx_unplugged))))
+}
+
+# Combine all chunks into a single dataframe
+tx_unplugged_shp <- do.call(rbind, results_list2)
+
+```
+
+```{r tx summary}
+# make summary df
+agg_tbl2 <- tx_plugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Plugged=n(),
+            .groups = 'drop') 
+# make summary df
+agg_tbl3 <- tx_unplugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Unplugged=n(),
+            .groups = 'drop') 
+
+# Merge summarized well counts back with the original al_cbg_ej data
+tx_hauser <- tx_cbg_ej %>%
+  st_join(agg_tbl) %>%
+  st_join(agg_tbl2) %>%
+  st_join(agg_tbl3) %>%
+  replace_na(list(Orphaned = 0)) %>%
+  replace_na(list(Plugged = 0)) %>%
+  replace_na(list(Unplugged = 0)) %>%
+  rename(GEOID = GEOID.x) %>%
+  subset(select = -c(GEOID.y, GEOID.x.1, GEOID.y.1)) %>%
+  # Define sample: drop rows where orphaned, plugged, and unplugged are all 0
+  filter(!(Orphaned == 0 & Plugged == 0 & Unplugged == 0)) %>%
+  st_drop_geometry()
+
+#### SAVE FILE
+write.csv(tx_hauser,
+          "/Users/gracehauser/Desktop/Publication/Results/EJ_state_summaries/TX.csv",
+          na = "")
+```
+
+#########################################
+# Utah
+#########################################
+
+```{r utah}
+# CBG shapefile
+ut_cbg <- block_groups(state = 'UT', year = 2021, class = "sf")
+# Convert CRS to WGS84
+ut_cbg <- st_transform(ut_cbg, crs = 4326)
+# EJ dataset
+ut_ej = ej %>%
+  filter(STATE == 'Utah')
+
+# Join ej data to shapefile
+ut_cbg_ej <- ut_cbg %>% 
+  left_join(ut_ej, by=c('GEOID' = 'GEOID_12')) %>%
+  mutate(POP_DENSITY = POP / ALAND)
+
+# Wells
+ut_wells = wells %>%
+  filter(wells$state == 'Utah')
+
+# CBG polygons contain points
+ut_cbg_ej_wells <- st_join(ut_wells, ut_cbg_ej)
+
+# make summary df
+agg_tbl <- ut_cbg_ej_wells %>% 
+  group_by(GEOID) %>% 
+  summarise(Orphaned=n(),
+            .groups = 'drop')
+```
+
+```{r utah plugged}
+# Select UT plugged wells
+ut_plugged <- all_wells_shp %>%
+  filter(stusps == 'UT' & ft_category == 'Plugged')
+
+# Define chunk size
+chunk_size <- 5000
+
+# Create an empty list to store results
+results_list <- list()
+
+# Loop over the dataset in chunks of 100 rows
+for (i in seq(1, nrow(ut_plugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- ut_plugged[i:min(i + chunk_size - 1, nrow(ut_plugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, ut_cbg, left = FALSE)
+  
+  # Append result to the list
+  results_list[[length(results_list) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(ut_plugged))))
+}
+
+# Combine all chunks into a single dataframe
+ut_plugged_shp <- do.call(rbind, results_list)
+
+```
+
+```{r utah unplugged}
+# Select UT unplugged wells
+ut_unplugged <- all_wells_shp %>%
+  filter(stusps == 'UT' & ft_category != 'Plugged')
+
+# Loop over the dataset in chunks of 5000 rows
+results_list2 <- list()
+
+for (i in seq(1, nrow(ut_unplugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- ut_unplugged[i:min(i + chunk_size - 1, nrow(ut_unplugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, ut_cbg)
+  
+  # Append result to the list
+  results_list2[[length(results_list2) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(ut_unplugged))))
+}
+
+# Combine all chunks into a single dataframe
+ut_unplugged_shp <- do.call(rbind, results_list2)
+
+```
+
+```{r ut summary}
+# make summary df
+agg_tbl2 <- ut_plugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Plugged=n(),
+            .groups = 'drop') 
+# make summary df
+agg_tbl3 <- ut_unplugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Unplugged=n(),
+            .groups = 'drop') 
+
+# Merge summarized well counts back with the original al_cbg_ej data
+ut_hauser <- ut_cbg_ej %>%
+  st_join(agg_tbl) %>%
+  st_join(agg_tbl2) %>%
+  st_join(agg_tbl3) %>%
+  replace_na(list(Orphaned = 0)) %>%
+  replace_na(list(Plugged = 0)) %>%
+  replace_na(list(Unplugged = 0)) %>%
+  rename(GEOID = GEOID.x) %>%
+  subset(select = -c(GEOID.y, GEOID.x.1, GEOID.y.1)) %>%
+  # Define sample: drop rows where orphaned, plugged, and unplugged are all 0
+  filter(!(Orphaned == 0 & Plugged == 0 & Unplugged == 0)) %>%
+  st_drop_geometry()
+
+#### SAVE FILE
+write.csv(ut_hauser,
+          "/Users/gracehauser/Desktop/Publication/Results/EJ_state_summaries/UT.csv",
+          na = "")
+```
+
+#########################################
+# West Virginia
+#########################################
+
+```{r west virginia}
+# CBG shapefile
+wv_cbg <- block_groups(state = 'WV', year = 2021, class = "sf")
+# Convert CRS to WGS84
+wv_cbg <- st_transform(wv_cbg, crs = 4326)
+# EJ dataset
+wv_ej = ej %>%
+  filter(STATE == 'West Virginia')
+
+# Join ej data to shapefile
+wv_cbg_ej <- wv_cbg %>% 
+  left_join(wv_ej, by=c('GEOID' = 'GEOID_12')) %>%
+  mutate(POP_DENSITY = POP / ALAND)
+
+# Wells
+wv_wells = wells %>%
+  filter(wells$state == 'West Virginia')
+
+# CBG polygons contain points
+wv_cbg_ej_wells <- st_join(wv_wells, wv_cbg_ej)
+
+# make summary df
+agg_tbl <- wv_cbg_ej_wells %>% 
+  group_by(GEOID) %>% 
+  summarise(Orphaned=n(),
+            .groups = 'drop')
+```
+
+```{r west virginia plugged}
+# Select WV plugged wells
+wv_plugged <- all_wells_shp %>%
+  filter(stusps == 'WV' & ft_category == 'Plugged')
+
+# Define chunk size
+chunk_size <- 5000
+
+# Create an empty list to store results
+results_list <- list()
+
+# Loop over the dataset in chunks of 100 rows
+for (i in seq(1, nrow(wv_plugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- wv_plugged[i:min(i + chunk_size - 1, nrow(wv_plugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, wv_cbg, left = FALSE)
+  
+  # Append result to the list
+  results_list[[length(results_list) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(wv_plugged))))
+}
+
+# Combine all chunks into a single dataframe
+wv_plugged_shp <- do.call(rbind, results_list)
+
+```
+
+```{r west virginia unplugged}
+# Select WV unplugged wells
+wv_unplugged <- all_wells_shp %>%
+  filter(stusps == 'WV' & ft_category != 'Plugged')
+
+# Loop over the dataset in chunks of 5000 rows
+results_list2 <- list()
+
+for (i in seq(1, nrow(wv_unplugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- wv_unplugged[i:min(i + chunk_size - 1, nrow(wv_unplugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, wv_cbg)
+  
+  # Append result to the list
+  results_list2[[length(results_list2) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(wv_unplugged))))
+}
+
+# Combine all chunks into a single dataframe
+wv_unplugged_shp <- do.call(rbind, results_list2)
+
+```
+
+```{r wv summary}
+# make summary df
+agg_tbl2 <- wv_plugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Plugged=n(),
+            .groups = 'drop') 
+# make summary df
+agg_tbl3 <- wv_unplugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Unplugged=n(),
+            .groups = 'drop') 
+
+# Merge summarized well counts back with the original al_cbg_ej data
+wv_hauser <- wv_cbg_ej %>%
+  st_join(agg_tbl) %>%
+  st_join(agg_tbl2) %>%
+  st_join(agg_tbl3) %>%
+  replace_na(list(Orphaned = 0)) %>%
+  replace_na(list(Plugged = 0)) %>%
+  replace_na(list(Unplugged = 0)) %>%
+  rename(GEOID = GEOID.x) %>%
+  subset(select = -c(GEOID.y, GEOID.x.1, GEOID.y.1)) %>%
+  # Define sample: drop rows where orphaned, plugged, and unplugged are all 0
+  filter(!(Orphaned == 0 & Plugged == 0 & Unplugged == 0)) %>%
+  st_drop_geometry()
+
+#### SAVE FILE
+write.csv(wv_hauser,
+          "/Users/gracehauser/Desktop/Publication/Results/EJ_state_summaries/WV.csv",
+          na = "")
+```
+
+#########################################
+# Wyoming
+#########################################
+
+```{r wyoming}
+# CBG shapefile
+wy_cbg <- block_groups(state = 'WY', year = 2021, class = "sf")
+# Convert CRS to WGS84
+wy_cbg <- st_transform(wy_cbg, crs = 4326)
+# EJ dataset
+wy_ej = ej %>%
+  filter(STATE == 'Wyoming')
+
+# Join ej data to shapefile
+wy_cbg_ej <- wy_cbg %>% 
+  left_join(wy_ej, by=c('GEOID' = 'GEOID_12')) %>%
+  mutate(POP_DENSITY = POP / ALAND)
+
+# Wells
+wy_wells = wells %>%
+  filter(wells$state == 'Wyoming')
+
+# CBG polygons contain points
+wy_cbg_ej_wells <- st_join(wy_wells, wy_cbg_ej)
+
+# make summary df
+agg_tbl <- wy_cbg_ej_wells %>% 
+  group_by(GEOID) %>% 
+  summarise(Orphaned=n(),
+            .groups = 'drop')
+```
+
+# Wyoming doesn't have any plugged wells
+
+```{r wyoming unplugged}
+# Select WY unplugged wells
+wy_unplugged <- all_wells_shp %>%
+  filter(stusps == 'WY' & ft_category != 'Plugged')
+
+# Loop over the dataset in chunks of 5000 rows
+results_list2 <- list()
+
+for (i in seq(1, nrow(wy_unplugged), by = chunk_size)) {
+  # Select a chunk of 100 rows
+  chunk <- wy_unplugged[i:min(i + chunk_size - 1, nrow(wy_unplugged)), ]
+  
+  # Perform spatial intersection
+  chunk_intersection <- st_join(chunk, wy_cbg)
+  
+  # Append result to the list
+  results_list2[[length(results_list2) + 1]] <- chunk_intersection
+  
+  # Print progress message
+  print(paste("Finished processing rows", i, "to", min(i + chunk_size - 1, nrow(wy_unplugged))))
+}
+
+# Combine all chunks into a single dataframe
+wy_unplugged_shp <- do.call(rbind, results_list2)
+
+```
+
+```{r wy summary}
+# make summary df
+agg_tbl3 <- wy_unplugged_shp %>% 
+  group_by(GEOID) %>% 
+  summarise(Unplugged=n(),
+            .groups = 'drop') 
+
+# Merge summarized well counts back with the original al_cbg_ej data
+wy_hauser <- wy_cbg_ej %>%
+  st_join(agg_tbl) %>%
+  st_join(agg_tbl3) %>%
+  replace_na(list(Orphaned = 0)) %>%
+  replace_na(list(Unplugged = 0)) %>%
+  # Make column for plugged
+  add_column(Plugged = 0) %>%
+  subset(select = -c(GEOID.y, GEOID)) %>%
+  #rename(GEOID = GEOID.x) %>%
+  # Define sample: drop rows where orphaned, plugged, and unplugged are all 0
+  filter(!(Orphaned == 0 & Plugged == 0 & Unplugged == 0)) %>%
+  st_drop_geometry()
+
+wy_hauser <- wy_hauser %>%
+  rename(GEOID = GEOID.x)
+
+#### SAVE FILE
+write.csv(wy_hauser,
+          "/Users/gracehauser/Desktop/Publication/Results/EJ_state_summaries/WY.csv",
+          na = "")
+```
+
+#
+#
+#
+#
+#
+#
+#
+###############################################################################
+## DESCRIPTIVE STATISTICS
+###############################################################################
+
+```{r import}
+folder = "/Users/gracehauser/Desktop/Publication/Results/EJ_state_summaries"
+files = list.files(
+  path = folder, 
+  pattern = ".*csv$",
+  ignore.case = T,
+  full.names = T
+)
+data = lapply(files, read.csv)
+
+# Read each CSV into a named list
+data_list <- lapply(files, function(f) as.data.frame(read.csv(f, stringsAsFactors = FALSE)))
+names(data_list) <- make.names(tools::file_path_sans_ext(basename(files)))  # Clean names
+
+# Assign each data frame to the global environment
+list2env(data_list, envir = .GlobalEnv)
+
+```
+
+``` {r define functions}
+#################################################
+# Function to plot the distribution of each variable by exposure status
+plot_distribution_by_exposure <- function(df) {
+  
+  # Define the EJ indicators within the function
+  ej_indicators <- c("POP_DENSITY", "PCT_UND5", "PCT_OV64", "PCT_POC", "PCT_LINGISO", 
+                     "PCT_MOBILE", "PCT_NOINT", "PCT_INCPLUMB", "PCT_PUBASSIST",
+                     "PCT_POV", "PCT_RENTBURD", "PCT_SINGPARENT", "PCT_NONHSGRAD",
+                     "PCT_UNINSUR", "PM25", "PMDIESL", "O3", "AIRTOX", "PCT_LEAD")
+
+  # Define exposed vs unexposed groups
+  df <- df %>%
+    mutate(exposed = ifelse(Orphaned > 0, "Exposed", "Unexposed"))
+  
+  # Pivot the data to a long format for plotting
+  df_long <- df %>%
+    pivot_longer(cols = all_of(ej_indicators), 
+                 names_to = "Indicator", 
+                 values_to = "Value")
+  
+  # Create the plot using ggplot
+  plot_list <- lapply(ej_indicators, function(indicator) {
+    ggplot(df_long %>% filter(Indicator == indicator), aes(x = Value, fill = exposed)) +
+      geom_histogram(position = "identity", alpha = 0.5, bins = 30) +
+      facet_wrap(~exposed) +
+      labs(title = paste("Distribution of", indicator), x = indicator, y = "Count") +
+      theme_minimal() +
+      scale_fill_manual(values = c("Exposed" = "blue", "Unexposed" = "red"))
+  })
+  
+  # Return the list of plots
+  return(plot_list)
+}
+
+#################################################
+summarize_orphaned_wells <- function(df) {
+  # List of EJ indicators
+  ej_indicators <- c("POP_DENSITY", "PCT_UND5", "PCT_OV64", "PCT_POC", "PCT_LINGISO", 
+                     "PCT_MOBILE", "PCT_NOINT", "PCT_INCPLUMB", "PCT_PUBASSIST",
+                     "PCT_POV", "PCT_RENTBURD", "PCT_SINGPARENT", "PCT_NONHSGRAD",
+                     "PCT_UNINSUR", "PM25", "PMDIESL", "O3", "AIRTOX", "PCT_LEAD")
+
+  # Define exposed vs unexposed groups
+  df <- df %>%
+    mutate(exposed = ifelse(Orphaned > 0, "Exposed", "Unexposed"))
+  
+
+  # Compute summary stats for EJ indicators by exposure group
+  ej_summary <- df %>%
+    group_by(exposed) %>%
+    summarise(across(all_of(ej_indicators), 
+                     list(MEAN = ~mean(.x, na.rm = TRUE), 
+                          MEDIAN = ~median(.x, na.rm = TRUE), 
+                          SD = ~sd(.x, na.rm = TRUE))),
+              .groups = "drop") %>%
+    pivot_longer(cols = -exposed, 
+                 names_to = c("Indicator", "Stat"), 
+                 names_pattern = "(.*)_(MEAN|MEDIAN|SD)",  
+                 values_to = "Value") %>%
+    pivot_wider(names_from = c(Stat, exposed), 
+                values_from = Value,
+                values_fn = mean, 
+                values_fill = list(Value = NA)) %>%
+    mutate(PCT_DIFF_MEANS = round((MEAN_Exposed - MEAN_Unexposed) / MEAN_Unexposed, 4)) %>%
+    arrange(desc(PCT_DIFF_MEANS))
+
+  # Extract the state name from the dataset
+  state_name <- unique(df$STATE)[1]
+
+  # Calculate additional statistics:
+  num_orphaned_wells <- sum(df$Orphaned, na.rm = TRUE)
+  num_exposed_pop <- sum(df$POP[df$exposed == "Exposed"], na.rm = TRUE)
+  num_cbg_with_orphaned <- sum(df$exposed == "Exposed", na.rm = TRUE)
+  num_cbg_without_orphaned <- sum(df$exposed == "Unexposed", na.rm = TRUE)
+
+  # Return results as a list
+  return(list(
+    ej_summary = ej_summary,
+    state_name = state_name,
+    num_orphaned_wells = num_orphaned_wells,
+    num_exposed_pop = num_exposed_pop,
+    num_cbg_with_orphaned = num_cbg_with_orphaned,
+    num_cbg_without_orphaned = num_cbg_without_orphaned
+  ))
+}
+
+#################################################
+assess_correlation <- function(df) {
+  
+  # Select the columns of interest
+  df_corr <- df %>%
+    subset(select = c("POP_DENSITY", "PCT_UND5", "PCT_OV64", "PCT_POC", "PCT_LINGISO", 
+                      "PCT_MOBILE", "PCT_NOINT", "PCT_INCPLUMB", "PCT_PUBASSIST",
+                      "PCT_POV", "PCT_RENTBURD", "PCT_SINGPARENT", "PCT_NONHSGRAD",
+                      "PCT_UNINSUR", "PM25", "PMDIESL", "O3", "AIRTOX", "PCT_LEAD",
+                      "Unplugged", "Orphaned"))
+  
+  # Remove all-NA or zero-variance columns
+  df_corr <- df_corr[, sapply(df_corr, function(x) !all(is.na(x)) && var(x, na.rm = TRUE) > 0)]
+
+  # Skip if there are less than 2 valid columns (cannot compute correlation)
+  if (ncol(df_corr) < 2) {
+    message("Skipping correlation plot: not enough valid variables")
+    return(NULL)
+  }
+  
+  # Compute correlation matrix using pairwise complete observations
+  corr_mat <- cor(df_corr, use = "pairwise.complete.obs")
+  
+  # Plot correlation
+  corrplot::corrplot(
+    corr_mat, 
+    type = "upper", 
+    method = "ellipse", 
+    order = "hclust", 
+    tl.col = "black", 
+    tl.cex = 0.75,
+    na.label = " "  # optional: blank for NA entries
+  )
+}
+
+```
+
+# WELL SUMMARY STATS & EJ SUMMARY STATS
+
+```{r well summary}
+# Clean states list
+for (state in names(data_list)) {
+  # Fix CO lacking a state abbrev
+  if (state == "CO") {
+    data_list[[state]]$ST_ABBREV <- "CO"
+  }
+  # States that are already empty
+  #if (state == "IN") next #Not included in this analysis
+  if (state == "MT") next #Not included in this analysis
+  
+  # Make exposed binary column: contains orphaned wells: Y/N
+  data_list[[state]] = mutate(data_list[[state]],
+                              EXP_BIN = ifelse(Orphaned >= 1, 1, 0))
+  # Convert POP_DENSITY units to ppl/sq mi
+  data_list[[state]] = mutate(data_list[[state]],
+                              POP_DENSITY = POP_DENSITY*2590000)
+}
+
+# Drop states
+data_list = data_list[names(data_list) != "MT"]
+```
+
+```{r iterate}
+# Function to model multiple states
+analyze_states <- function(state_list) {
+  
+  results <- purrr::map(state_list, function(df) {
+    list(
+      plots = plot_distribution_by_exposure(df),
+      summary = summarize_orphaned_wells(df)
+    )
+  }) 
+  return(results)
+}
+
+# Run for all imported datasets
+all_results <- analyze_states(data_list)
+
+# Extract and compile results for all states
+state_summaries <- purrr::map(all_results, "summary")
+
+# Orphaned wells & CBGs
+state_stats <- bind_rows(
+  purrr::map(state_summaries, ~ tibble(
+    State = .x$State,
+    state_name = .x$state_name,
+    num_orphaned_wells = .x$num_orphaned_wells,
+    num_exposed_pop = .x$num_exposed_pop,
+    num_cbg_with_orphaned = .x$num_cbg_with_orphaned,
+    num_cbg_without_orphaned = .x$num_cbg_without_orphaned
+  )), 
+  .id = "State")
+print(state_stats) 
+
+# EJ summary
+summary_df <- bind_rows(purrr::map(state_summaries, "ej_summary"), .id = "State")
+print(summary_df)
+
+```
+
+# FOR REGRESSION
+
+```{r import2}
+folder = "/Users/gracehauser/Desktop/Publication/Results/EJ_state_summaries"
+files = list.files(
+  path = folder, 
+  pattern = ".*csv$",
+  ignore.case = T,
+  full.names = T
+)
+data = lapply(files, read.csv)
+
+# Read each CSV into a named list
+data_list <- lapply(files, function(f) as.data.frame(read.csv(f, stringsAsFactors = FALSE)))
+names(data_list) <- make.names(tools::file_path_sans_ext(basename(files)))  # Clean names
+
+# Assign each data frame to the global environment
+list2env(data_list, envir = .GlobalEnv)
+
+```
+
+```{r clean}
+# Clean states list
+for (state in names(data_list)) {
+  # Fix CO lacking a state abbrev
+  if (state == "CO") {
+    data_list[[state]]$ST_ABBREV <- "CO"
+  }
+  # Indiana is already empty
+  if (state == "IN") next
+  # Drop count, MOE, and area-weighted variables
+  data_list[[state]] = subset(data_list[[state]], select = -c(
+    NUM_UND5, NUM_OV64, NUM_POC, NUM_LINGISO, PCT_RENT, MOE_RENT,
+    MOE_MOBILE, MOE_NOINT, PCT_NOCOMP, MOE_NOCOMP, MOE_INCPLUMB,
+    MOE_PUBASSIST, PCT_05POV, MOE_05POV, MOE_POV, PCT_15POV, MOE_15POV,
+    PCT_2POV, MOE_2POV, MOE_RENTBURD, PCT_EXTRENTBURD,
+    MOE_EXTRENTBURD, MOE_SINGPARENT, MOE_NONHSGRAD, EDUCSCORE,
+    MOE_EDUCSCORE, PCT_UND18INSUR, MOE_UND18INSUR, PCT_OV64INSUR,
+    MOE_OV64INSUR, MOE_UNINSUR, AIRTOXCANCER, AIRTOXRESPHI,
+    SUPERFUND, SUPERFUNDSCORE, HAZWST, HAZWSTSCORE, WWDISCHRG,
+    UNDGTANKS, LEAD, RMPSCORE))
+  # Make exposed binary column: contains orphaned wells: Y/N
+  data_list[[state]] = mutate(data_list[[state]],
+                              EXP_BIN = ifelse(Orphaned >= 1, 1, 0))
+  # Convert POP_DENSITY units to ppl/sq mi
+  data_list[[state]] = mutate(data_list[[state]],
+                              POP_DENSITY = POP_DENSITY*2590000)
+  # Scale diesel PM variable
+  data_list[[state]] = mutate(data_list[[state]],
+                              PMDIESL = PMDIESL*1000)
+  # Standardize all percentage variables by dividing by 0.10
+  cols_to_divide <- c("PCT_UND5", "PCT_OV64", "PCT_POC", "PCT_LINGISO", "PCT_MOBILE",
+                      "PCT_NOINT", "PCT_INCPLUMB", "PCT_PUBASSIST", "PCT_POV", 
+                      "PCT_RENTBURD", "PCT_SINGPARENT", "PCT_NONHSGRAD", "PCT_UNINSUR",
+                      "PCT_LEAD")
+  data_list[[state]] <- data_list[[state]] %>%
+    mutate(across(all_of(cols_to_divide), ~ .x / 0.10, .names = "{.col}"))
+  
+  # Delete any rows with NAs
+  data_list[[state]] = na.omit(data_list[[state]])
+}
+
+# Drop states that are now empty from data_list
+data_list = data_list[names(data_list) != "AK"]
+data_list = data_list[names(data_list) != "IN"]
+# Drop MO ---why??
+data_list = data_list[names(data_list) != "MO"]
+data_list = data_list[names(data_list) != "MT"]
+
+# Keep states with the top 10 highest exposed + unexposed totals
+# Make a summary table of exposed/unexposed counts by state
+state_counts <- lapply(names(data_list), function(st) {
+  df <- data_list[[st]]
+  data.frame(
+    state = st,
+    exposed = sum(df$EXP_BIN == 1, na.rm = TRUE),
+    unexposed = sum(df$EXP_BIN == 0, na.rm = TRUE)
+  )
+}) %>% dplyr::bind_rows()
+
+top_states <- state_counts %>%
+  mutate(total = exposed + unexposed) %>%
+  arrange(desc(total)) %>%
+  slice_head(n = 10) %>%
+  pull(state)
+
+# Filter data_list to only include those states
+data_list <- data_list[names(data_list) %in% top_states]
+print(paste("Keeping:", paste(top_states, collapse = ", ")))
+```
+```{r assess multicol: TX}
+library(car)   # for vif()
+
+# Pull Texas data
+tx <- data_list[["TX"]]
+
+summary(tx$Orphaned)
+
+# Choose predictors 
+predictors <- tx %>%
+  dplyr::select(PCT_UND5, PCT_OV64, PCT_POC, PCT_LINGISO, PCT_MOBILE, PCT_NOINT,
+           PCT_INCPLUMB, PCT_PUBASSIST, PCT_POV, PCT_RENTBURD, PCT_SINGPARENT,
+           PCT_NONHSGRAD, PCT_UNINSUR, PM25, PMDIESL, O3, AIRTOX, PCT_LEAD,
+           Unplugged)
+# Combine predictors with outcome and offset
+model_data <- cbind(Orphaned = tx$Orphaned, POP_DENSITY = tx$POP_DENSITY, predictors)
+
+
+# Fit a linear/GLM for VIF
+vif_model <- glm(Orphaned ~ ., data = model_data, family = poisson)
+vif(vif_model)
+
+library(pscl) 
+
+# Fit zero-inflated negative binomial model with offset
+zinb_tx <- zeroinfl(Orphaned ~ . + offset(log(POP_DENSITY + 1)) | 1,
+                    data = model_data,
+                    dist = "negbin",
+                    EM = TRUE)  # EM helps with convergence
+
+summary(zinb_tx)
+
+# Extract IRRs for count model
+count_coefs <- coef(zinb_tx$count)
+IRRs <- exp(count_coefs)
+IRRs
+
+# Confidence intervals
+confint(zinb_tx)
+
+
+# Check VIFs
+vif_values <- vif(tx_nb)
+print(vif_values)
+
+# Flag high-VIF variables (commonly > 5 or > 10)
+high_vif <- vif_values[vif_values > 5]
+print("High VIF variables:")
+print(high_vif)
+
+```
+
+
+```{r define regr}
+# Define Stepwise Negative Binomial Regression Function
+run_nb_regression <- function(df, state_name) {
+  # Check if outcome has enough variation
+  if (all(df$Orphaned == 0) | var(df$Orphaned) == 0) {
+    message(state_name, ": skipped (no variation in Orphaned counts)")
+    return(NULL)  
+  }
+  
+  tryCatch({
+    model <- MASS::glm.nb(
+      Orphaned ~ PCT_UND5 + PCT_OV64 + PCT_POC + PCT_LINGISO +
+        PCT_MOBILE + PCT_NOINT + PCT_INCPLUMB + PCT_PUBASSIST +
+        PCT_POV + PCT_RENTBURD + PCT_SINGPARENT + PCT_NONHSGRAD +
+        PCT_UNINSUR + PM25 + O3 + PMDIESL + AIRTOX + PCT_LEAD + Unplugged + 
+        offset(log(POP_DENSITY)),
+      data = df
+    )
+    
+    # Stepwise selection
+    stepwise_model <- step(model, direction = "both", trace = 0)  
+    
+    # Extract values
+    log_coefs <- coef(stepwise_model)
+    SEs <- sqrt(diag(vcov(stepwise_model)))
+    IRRs <- exp(log_coefs) 
+    CIs <- exp(confint(stepwise_model)) 
+    
+    results <- list(
+      state = state_name,
+      ej_metric = names(log_coefs),
+      log_coef = log_coefs, 
+      SEs = SEs,  
+      IRRs = IRRs,
+      CI_lower = CIs[,1],
+      CI_upper = CIs[,2]
+    )
+    
+    return(results)
+    
+  }, error = function(e) {
+    message(state_name, ": model failed — ", conditionMessage(e))
+    return(NULL)
+  })
+}
+
+
+# Define function to run across all states
+
+analyze_states <- function(data_list) {
+  results <- purrr::map2(data_list, names(data_list), function(df, state_nm) {
+    list(
+      plots = plot_distribution_by_exposure(df),
+      summary = summarize_orphaned_wells(df),
+      correlations = assess_correlation(df)
+    )
+  })
+  return(results)
+}
+
+# Assess multicolinearity
+multicol <- analyze_states(data_list)
+```
+
+``` {r iterate regr}
+# Remove predictors based on multicol.
+# Remove PM25 and PCT_POV from every dataframe in data_list
+data_list <- purrr::map(data_list, ~ dplyr::select(.x, -c(PM25, PCT_POV)))
+
+
+# Redefine function to run across all states
+analyze_states <- function(data_list) {
+  results <- purrr::map2(data_list, names(data_list), function(df, state_nm) {
+    # Remove PM25 and PCT_POV before analysis
+    list(
+      regr = run_nb_regression(df, state_nm)   # pass state name
+    )
+  })
+  return(results)
+}
+
+# Run across all imported datasets
+all_results <- analyze_states(data_list)
+# Extract and compile results for all states
+state_summaries <- purrr::map(all_results, "summary")
+```
+
+```{r regr summary}
+# Orphaned wells & CBGs
+state_stats <- bind_rows(
+  purrr::map(state_summaries, ~ tibble(
+    State = .x$State,
+    state_name = .x$state_name,
+    num_orphaned_wells = .x$num_orphaned_wells,
+    num_cbg_with_orphaned = .x$num_cbg_with_orphaned,
+    num_cbg_without_orphaned = .x$num_cbg_without_orphaned
+  )), 
+  .id = "State")
+print(state_stats)
+
+# EJ summary
+summary_df <- bind_rows(purrr::map(state_summaries, "ej_summary"), .id = "State")
+print(summary_df)
+
+# Get model results
+model_results <- purrr::map(all_results, "model")
+
+# Log regression results: print ORs and CIs
+logistic_OR_CIs <- purrr::map(all_results, "regr") %>% 
+  purrr::discard(is.null) %>%  # remove states with failed regression
+  purrr::imap_dfr(~ {
+    tibble(
+      state = .y,
+      predictor = .x$ej_metric,
+      log_coef = .x$log_coef,
+      SE = .x$SEs,
+      IRR = .x$IRRs,
+      CI_lower = .x$CI_lower,
+      CI_upper = .x$CI_upper
+    )
+  })
+
+```
+
+
+
+```{r iterate}
+#################################################
+# Stepwise Negative Binomial Regression Function
+run_nb_regression <- function(df) {
+  # Check if outcome has enough variation
+  if (all(df$Orphaned == 0) | var(df$Orphaned) == 0) {
+    return(NULL)  # skip this state
+  }
+  
+  # Fit  regression
+  tryCatch({
+    model <- MASS::glm.nb(Orphaned ~ PCT_UND5 + PCT_OV64 + PCT_POC + PCT_LINGISO +
+                   PCT_MOBILE + PCT_NOINT + PCT_INCPLUMB + PCT_PUBASSIST +
+                   PCT_POV + PCT_RENTBURD + PCT_SINGPARENT + PCT_NONHSGRAD +
+                   PCT_UNINSUR + PM25 + O3 + PMDIESL + AIRTOX + PCT_LEAD +
+                   POP_DENSITY + Unplugged,
+                 data = df)
+  }, error = function(e) {
+    message("Model failed for state, returning NULL: ", conditionMessage(e))
+    return(NULL)
+  })
+}
+  
+  # Stepwise model selection
+  stepwise_model <- step(model, direction = "both", trace = 0)  
+  
+  # Extract values
+  log_coefs <- coef(stepwise_model)
+  SEs <- sqrt(diag(vcov(stepwise_model)))
+  IRRs <- exp(log_coefs) 
+  CIs <- exp(confint(stepwise_model)) 
+
+  # Store results in a list
+  results <- list(
+    ej_metric = names(log_coefs),
+    log_coef = log_coefs, 
+    SEs = SEs,  
+    IRRs = IRRs,
+    CIs = CIs,
+    CI_lower = CIs[,1],
+    CI_upper = CIs[,2])
+
+return(results)
+
+
+# Function to model multiple states
+analyze_states <- function(data_list) {
+  results <- purrr::map(data_list, function(df) {
+    list(
+      plots = plot_distribution_by_exposure(df),
+      summary = summarize_orphaned_wells(df),
+      correlations = assess_correlation(df),
+      regr = run_nb_regression(df)      # new negative binomial
+    )
+  })
+  return(results)
+}
+
+# Run for all imported datasets
+all_results <- analyze_states(data_list)
+
+# Extract and compile results for all states
+state_summaries <- purrr::map(all_results, "summary")
+
+# Orphaned wells & CBGs
+state_stats <- bind_rows(
+  purrr::map(state_summaries, ~ tibble(
+    State = .x$State,
+    state_name = .x$state_name,
+    num_orphaned_wells = .x$num_orphaned_wells,
+    num_cbg_with_orphaned = .x$num_cbg_with_orphaned,
+    num_cbg_without_orphaned = .x$num_cbg_without_orphaned
+  )), 
+  .id = "State")
+print(state_stats)
+
+# EJ summary
+summary_df <- bind_rows(purrr::map(state_summaries, "ej_summary"), .id = "State")
+print(summary_df)
+
+# Get model results
+model_results <- purrr::map(all_results, "model")
+
+# Log regression results: print ORs and CIs
+logistic_OR_CIs <- purrr::map(all_results, ~ {
+  log_coefs <- .x$regr$log_coefs 
+  SE <- .x$regr$SEs
+  IRR <- .x$regr$IRRs 
+  CI_lower <- .x$regr$CI_lower
+  CI_upper <-.x$regr$CI_upper
+  # Combine OR and CIs into a data frame or list
+  data.frame(
+    log_coef = log_coefs,
+    SE = SE,
+    IRR = IRR,
+    CI_lower = CI_lower,
+    CI_upper = CI_upper 
+  )
+})
+
+```
+
+
+```{r meta regr}
+# Initialize 'meta_results' with data frames for each predictor
+predictors = c("POP_DENSITY", "PCT_UND5", "PCT_OV64", "PCT_POC", "PCT_LINGISO", 
+               "PCT_MOBILE", "PCT_NOINT","PCT_INCPLUMB", "PCT_PUBASSIST",
+               "PCT_POV", "PCT_RENTBURD","PCT_SINGPARENT", "PCT_NONHSGRAD",
+               "PCT_UNINSUR", "PM25", "PMDIESL", "O3", "AIRTOX", "PCT_LEAD",
+               "Unplugged", "Orphaned")
+
+meta_analysis <- lapply(predictors, function(x) data.frame(State = character(),
+                                                          log_IRR = numeric(),
+                                                          SE = numeric(),
+                                                          stringsAsFactors = FALSE))
+names(meta_analysis) <- predictors
+
+all_results[[state]]$regr$log_coef
+all_results[[state]]$regr$SEs
+
+# Loop through each state's dataset from nb regr
+for (state in names(all_results)) {
+  nb_res <- all_results[[state]]$regr
+  
+  # Skip states where regression failed
+  if (is.null(nb_res)) next
+
+  for (predictor in predictors) {
+    if (predictor %in% nb_res$ej_metric) {
+      log_IRR <- nb_res$log_coef[predictor]
+      SE <- nb_res$SEs[predictor]
+      
+      # Append results
+      meta_analysis[[predictor]] <- rbind(meta_analysis[[predictor]], 
+                                         data.frame(State = state,
+                                                    log_IRR = log_IRR,
+                                                    SE = SE))
+    }
+  }
+}
+
+# Create an empty list to store meta-analysis results
+meta_analysis_results <- list()
+
+# Loop through each predictor and RUN meta-analysis
+for (predictor in names(meta_analysis)) {
+  df <- meta_analysis[[predictor]]
+  
+  # Empty, throwing error
+  if (nrow(df) == 0) next
+  
+  # Run meta-analysis using rma()
+  meta_analysis_results[[predictor]] <- rma(yi = df$log_IRR,
+                                            sei = df$SE,
+                                            method = "REML",
+                                            data = df,
+                                            slab = df$State)
+  }
+
+```
+# FOREST PLOTS FOR STEPWISE REGRESSION
+
+``` {r forest plots step}
+#POP_DENSITY
+forest(meta_analysis_results[['POP_DENSITY']], 
+       transf = exp,
+       xlim = c(0, 2), # Adjust x-axis limits to fit data range
+       refline = 1, # Reference line at OR = 1 (no effect)
+       slab = meta_analysis[['POP_DENSITY']][['State']], 
+       main = "Forest Plot for Population Density",
+       xlab = "IRR for a 1 person per square mile increase", # Label for the x-axis
+       col = "skyblue") # Color for the plot
+
+#PCT_UND5
+forest(meta_analysis_results[['PCT_UND5']], 
+       transf = exp,
+       xlim = c(-0.2, 1.5),
+       refline = 1, 
+       slab = meta_analysis[['PCT_UND5']][['State']],
+       main = "Forest Plot for Percent Under 5 years old",
+       xlab = "IRR per 10 percentage point increase", 
+       col = "skyblue") 
+
+#PCT_OV64
+forest(meta_analysis_results[['PCT_OV64']], 
+       transf = exp,
+       xlim = c(0.3, 1.2), 
+       refline = 1, 
+       slab = meta_analysis[['PCT_OV64']][['State']], 
+       main = "Forest Plot for Percent Over 64 years old",
+       xlab = "IRR per 10 percentage point increase", 
+       col = "skyblue") 
+
+#PCT_POC
+forest(meta_analysis_results[['PCT_POC']], 
+       transf = exp,
+       xlim = c(0.5, 1.5), 
+       refline = 1,
+       slab = meta_analysis[['PCT_POC']][['State']],
+       main = "Forest Plot for Percent People of Color",
+       xlab = "IRR per 10 percentage point increase", 
+       col = "skyblue") 
+
+#PCT_LINGISO
+forest(meta_analysis_results[['PCT_LINGISO']], 
+       transf = exp,
+       xlim = c(0.5, 2), 
+       refline = 1, 
+       slab = meta_analysis[['PCT_LINGISO']][['State']], 
+       main = "Forest Plot for Percent Linguistically Isolated",
+       xlab = "IRR per 10 percentage point increase",
+       col = "skyblue") 
+
+#PCT_MOBILE
+forest(meta_analysis_results[['PCT_MOBILE']], 
+       transf = exp,
+       xlim = c(0.5, 1.8), 
+       refline = 1, 
+       slab = meta_analysis[['PCT_MOBILE']][['State']], 
+       main = "Forest Plot for Percent Mobile Homes",
+       xlab = "IRR per 10 percentage point increase", 
+       col = "skyblue") 
+
+#PCT_NOINT
+forest(meta_analysis_results[['PCT_NOINT']], 
+       transf = exp,
+       xlim = c(0.4, 1.5), 
+       refline = 1, 
+       slab = meta_analysis[['PCT_NOINT']][['State']], 
+       main = "Forest Plot for Percent No Internet at Home",
+       xlab = "IRR per 10 percentage point increase", 
+       col = "skyblue") 
+
+#PCT_INCPLUMB
+forest(meta_analysis_results[['PCT_INCPLUMB']], 
+       transf = exp,
+       xlim = c(-0.2, 2.2), 
+       refline = 1, 
+       slab = meta_analysis[['PCT_INCPLUMB']][['State']], 
+       main = "Forest Plot for Percent Incomplete Plumbing",
+       xlab = "IRR per 10 percentage point increase", 
+       col = "skyblue") 
+
+#PCT_PUBASSIST
+forest(meta_analysis_results[['PCT_PUBASSIST']], 
+       transf = exp,
+       xlim = c(0.4, 1.6), 
+       refline = 1, 
+       slab = meta_analysis[['PCT_PUBASSIST']][['State']], 
+       main = "Forest Plot for Percent Receiving Public Assistance",
+       xlab = "IRR per 10 percentage point increase", 
+       col = "skyblue") 
+
+#PCT_POV
+forest(meta_analysis_results[['PCT_POV']], 
+       transf = exp,
+       xlim = c(0.3, 1.7), 
+       refline = 1, 
+       slab = meta_analysis[['PCT_POV']][['State']],
+       main = "Forest Plot for Percent in Poverty",
+       xlab = "IRR per 10 percentage point increase", 
+       col = "skyblue") 
+
+#PCT_RENTBURD
+forest(meta_analysis_results[['PCT_RENTBURD']], 
+       transf = exp,
+       xlim = c(0.7, 1.2), 
+       refline = 1, 
+       slab = meta_analysis[['PCT_RENTBURD']][['State']], 
+       main = "Forest Plot for Percent Rent Burdened",
+       xlab = "IRR per 10 percentage point increase", 
+       col = "skyblue") 
+
+#PCT_SINGPARENT
+forest(meta_analysis_results[['PCT_SINGPARENT']], 
+       transf = exp,
+       xlim = c(0.5, 1.5), 
+       refline = 1, 
+       slab = meta_analysis[['PCT_SINGPARENT']][['State']], 
+       main = "Forest Plot for Percent Single Parent Household",
+       xlab = "IRR per 10 percentage point increase", 
+       col = "skyblue") 
+
+#PCT_NOHS
+forest(meta_analysis_results[['PCT_NONHSGRAD']], 
+       transf = exp,
+       xlim = c(0.2, 1.3), 
+       refline = 1, 
+       slab = meta_analysis[['PCT_NONHSGRAD']][['State']], 
+       main = "Forest Plot for Percent Non-Highschool Graduate",
+       xlab = "IRR per 10 percentage point increase", 
+       col = "skyblue") 
+
+#PCT_UNINSUR
+forest(meta_analysis_results[['PCT_UNINSUR']], 
+       transf = exp,
+       xlim = c(0, 2.2), 
+       refline = 1, 
+       slab = meta_analysis[['PCT_UNINSUR']][['State']], 
+       main = "Forest Plot for Percent Uninsured",
+       xlab = "IRR per 10 percentage point increase", 
+       col = "skyblue") 
+
+#PM25
+forest(meta_analysis_results[['PM25']], 
+       transf = exp,
+       xlim = c(-0.5, 2.2), 
+       refline = 1, 
+       slab = meta_analysis[['PM25']][['State']], 
+       main = "Forest Plot for PM2.5",
+       xlab = "IRR per 1 ug/cubic meter increase", 
+       col = "skyblue") 
+
+#PMDIESL
+forest(meta_analysis_results[['PMDIESL']], 
+       transf = exp,
+       xlim = c(0.9, 1.1), 
+       refline = 1, 
+       slab = meta_analysis[['PMDIESL']][['State']], 
+       main = "Forest Plot for Diesel PM",
+       xlab = "IRR per 1 mg/cubic meter increase", 
+       col = "skyblue") 
+
+#O3
+forest(meta_analysis_results[['O3']], 
+       transf = exp,
+       xlim = c(0.5, 1.5), 
+       refline = 1, 
+       slab = meta_analysis[['O3']][['State']], 
+       main = "Forest Plot for Ozone",
+       xlab = "IRR per 1 ppb increase", 
+       col = "skyblue") 
+
+#AIRTOX
+forest(meta_analysis_results[['AIRTOX']], 
+       transf = exp,
+       xlim = c(0.3, 1.5), 
+       refline = 1, 
+       slab = meta_analysis[['AIRTOX']][['State']], 
+       main = "Forest Plot for Air Toxics",
+       xlab = "IRR per 1 unit increase", 
+       col = "skyblue") 
+
+#PCT_LEAD
+forest(meta_analysis_results[['PCT_LEAD']], 
+       transf = exp,
+       xlim = c(0.5, 1.5), 
+       refline = 1, 
+       slab = meta_analysis[['PCT_LEAD']][['State']], 
+       main = "Forest Plot for Percent Housing with Lead",
+       xlab = "IRR per 10 percentage point increase", 
+       col = "skyblue") 
+
+#Unplugged
+forest(meta_analysis_results[['Unplugged']], 
+       transf = exp,
+       xlim = c(0.9, 1.1),
+       refline = 1, 
+       slab = meta_analysis[['Unplugged']][['State']], 
+       main = "Forest Plot for Unplugged Well Count",
+       xlab = "??", 
+       col = "skyblue")
+```
+
+# REGULAR REGRESSION
+
+```{r again}
+#################################################
+# Stepwise Logistic Regression Function
+run_logistic_regression <- function(df) {
+  
+  # Fit logistic regression
+  model <- glm(EXP_BIN ~ PCT_UND5 + PCT_OV64 + PCT_POC + PCT_LINGISO +
+                 PCT_MOBILE + PCT_NOINT + PCT_INCPLUMB + PCT_PUBASSIST +
+                 PCT_POV + PCT_RENTBURD + PCT_SINGPARENT + PCT_NONHSGRAD +
+                 PCT_UNINSUR + PM25 + O3 + PMDIESL + AIRTOX + PCT_LEAD +
+                 POP_DENSITY + Unplugged,
+               data = df,
+               family = "binomial")
+  
+  # Extract values
+  log_odds <- coef(model)
+  SEs <- sqrt(diag(vcov(model)))
+  ORs <- exp(log_odds) 
+  CIs <- exp(confint(model)) 
+
+  # Store results in a list
+  results <- list(
+    ej_metric = names(log_odds),
+    log_odds = log_odds, 
+    SEs = SEs,  
+    ORs = ORs,
+    CIs = CIs,
+    CI_lower = CIs[,1],
+    CI_upper = CIs[,2])
+
+return(results)
+
+}
+
+
+# Function to model multiple states
+analyze_states <- function(state_list) {
+  
+  results <- purrr::map(state_list, function(df) {
+    list(
+      plots = plot_distribution_by_exposure(df),
+      summary = summarize_orphaned_wells(df),
+      correlations = assess_correlation(df),
+      model = run_logistic_models(df),
+      regr = run_logistic_regression(df)
+    )
+  })
+  return(results)
+}
+
+# Run for all imported datasets
+all_results <- analyze_states(data_list)
+
+# Extract and compile results for all states
+state_summaries <- purrr::map(all_results, "summary")
+
+# Orphaned wells & CBGs
+state_stats <- bind_rows(
+  purrr::map(state_summaries, ~ tibble(
+    State = .x$State,
+    state_name = .x$state_name,
+    num_orphaned_wells = .x$num_orphaned_wells,
+    num_cbg_with_orphaned = .x$num_cbg_with_orphaned,
+    num_cbg_without_orphaned = .x$num_cbg_without_orphaned
+  )), 
+  .id = "State")
+print(state_stats)
+
+# EJ summary
+summary_df <- bind_rows(purrr::map(state_summaries, "ej_summary"), .id = "State")
+print(summary_df)
+
+# Get model results
+model_results <- purrr::map(all_results, "model")
+
+# Log regression results: print ORs and CIs
+logistic_OR_CIs <- purrr::map(all_results, ~ {
+  log_odds <- .x$regr$log_odds 
+  SE <- .x$regr$SEs
+  OR <- .x$regr$ORs 
+  CI_lower <- .x$regr$CI_lower
+  CI_upper <-.x$regr$CI_upper
+  # Combine OR and CIs into a data frame or list
+  data.frame(
+    log_odds = log_odds,
+    SE = SE,
+    OR = OR,
+    CI_lower = CI_lower,
+    CI_upper = CI_upper 
+  )
+})
+```
+
+
+```{r meta2}
+# Initialize 'meta_results' with data frames for each predictor
+predictors = c("POP_DENSITY", "PCT_UND5", "PCT_OV64", "PCT_POC", "PCT_LINGISO", 
+               "PCT_MOBILE", "PCT_NOINT","PCT_INCPLUMB", "PCT_PUBASSIST",
+               "PCT_POV", "PCT_RENTBURD","PCT_SINGPARENT", "PCT_NONHSGRAD",
+               "PCT_UNINSUR", "PM25", "PMDIESL", "O3", "AIRTOX", "PCT_LEAD",
+               "Unplugged", "Orphaned")
+
+meta_analysis <- lapply(predictors, function(x) data.frame(State = character(),
+                                                          log_odds = numeric(),
+                                                          SE = numeric(),
+                                                          stringsAsFactors = FALSE))
+names(meta_analysis) <- predictors
+
+# Loop through each state's dataset in data_list
+for (state in names(data_list)) {
+
+  state_df <- data_list[[state]]
+  meta_results <- run_logistic_regression(state_df)
+  
+  for (predictor in predictors) {
+    if (predictor %in% names(meta_results$log_odds)) {
+      log_odds <- meta_results$log_odds[predictor]
+      SE <- meta_results$SEs[predictor]
+      
+      # Append results
+      meta_analysis[[predictor]] <- rbind(meta_analysis[[predictor]], 
+                                         data.frame(State = state,
+                                                    log_odds = log_odds,
+                                                    SE = SE))
+    }
+  }
+}
+
+# Create an empty list to store meta-analysis results
+meta_analysis_results <- list()
+
+# Loop through each predictor and RUN meta-analysis
+for (predictor in names(meta_analysis)) {
+  
+  # Empty, throwing error
+  if (predictor == "PCT_NONHSGRAD") {
+    next  # Skip this iteration
+  }
+  
+  # Empty, throwing error
+  if (predictor == "Orphaned") {
+    next  # Skip this iteration
+  }
+  
+  # Run meta-analysis using rma()
+  meta_analysis_results[[predictor]] <- rma(yi = meta_analysis[[predictor]]$log_odds, 
+                                            sei = meta_analysis[[predictor]]$SE, 
+                                            method = "REML",                         
+                                            data = meta_analysis[[predictor]],
+                                            slab = meta_analysis[[predictor]]$State)
+  }
+
+```
+
+
+```{r maps}
+library(cowplot)
+library(ggrepel)
+library(patchwork)
+library(RColorBrewer)
+library(terra) 
+library(tmap)
+library(sf)
+
+# Reproject data
+wells = st_transform(wells, 4326)
+states <- read_sf("/Users/gracehauser/Desktop/Important/Yale/Fall_2024/Data_Viz/Final_Project/cb_2019_us_state_5m/cb_2019_us_state_5m.shp")
+
+
+###############################################################################
+################################# Chart 1: Map ################################
+###############################################################################
+
+# Split states into CONUS and Alaska
+states$STATEFP <- as.character(states$STATEFP)
+conus <- states[!states$STATEFP %in% c("66", "69", "60", "15", "02", "78", "72"), ]
+alaska <- states[states$STATEFP == "02", ]
+missing_states <- states[states$NAME %in% c(
+  "Maine", "New Hampshire", "Delaware", "District of Columbia", "South Carolina",
+  "Washington", "Georgia", "Wisconsin", "Oregon", "Illinois", "Vermont",
+  "Connecticut", "Minnesota", "Maryland", "Arizona", "Rhode Island", "North Carolina",
+  "Virginia", "Massachusetts", "Idaho", "New Jersey", "Iowa", "Montana"
+), ]
+
+# Transform to match map projections
+conus <- st_transform(conus, 5070)
+missing_states <- st_transform(missing_states, 5070)
+alaska <- st_transform(alaska, 3338)
+
+# Split wells for projections
+wells_conus <- wells[!wells$st_abbrev %in% c("AK", "HI"), ] |> st_transform(5070)
+wells_ak <- wells[wells$st_abbrev == "AK", ] |> st_transform(3338)
+
+# Main CONUS map
+main_map <- ggplot() +
+  geom_sf(data = conus, aes(fill = "With Data"), color = "black", lwd = 0.4) +
+  geom_sf(data = missing_states, aes(fill = "Missing Data"), color = "black", lwd = 0.4) +
+  geom_sf(data = wells_conus, fill = "deepskyblue4", color = "black", size = 1, alpha = 0.3) +
+  scale_fill_manual(values = c("With Data" = "gray90", "Missing Data" = "white"),
+                    name = "Data Availability", na.translate = FALSE) +
+  labs(title = "2025 Orphaned Wells") +
+  theme_map() +
+  coord_sf(xlim = c(-2356113.7, 2258200.2), ylim = c(268091.2, 3172567.9)) +
+  theme(plot.margin = margin(l = 30),
+        legend.position = "bottom",
+        legend.box = "vertical")
+main_map
+
+# Alaska inset
+inset_map <- ggplot() +
+  geom_sf(data = alaska, fill = "gray95", color = "black", lwd = 0.4) +
+  geom_sf(data = wells_ak, color = "deepskyblue4", size = 1, alpha = 0.6) +
+  theme_map() +
+  coord_sf(xlim = c(-2168054.4, 1493082.3), ylim = c(415756.6, 2374440.3)) +
+  theme(legend.position = "none")
+inset_map
+
+# Combine
+ggdraw() +
+  draw_plot(main_map) +
+  draw_plot(inset_map, height = 0.3, x = -0.38, y = 0.10)
+
+
+###############################################################################
+################################# Chart 2: Map ################################
+###############################################################################
+
+main_map <- ggplot() +
+  # Shading states by data availability
+  geom_sf(data = conus, aes(fill = "Included"), color = "black", lwd = 0.4) +
+  geom_sf(data = missing_states, aes(fill = "No Data Collected"), color = "black", lwd = 0.4) +
+  # Orphaned wells
+  geom_sf(data = wells, shape = 21, fill = "deepskyblue4", color = "black", size = 1, stroke = 0.3, alpha = 0.5) +
+  # Scales for legends
+  scale_fill_manual(
+    values = c("Included" = "gray90", "No Data Collected" = "white"),
+    name = "Data Availability",
+    na.translate = FALSE)+  # Suppresses NA entries in the legend
+  # Labels and Themes
+  labs() +
+  theme_map() +
+  coord_sf(xlim = c(-2500000, 2500000), ylim = c(100000, 3200000))+
+  theme(plot.margin = margin(l = 30, b = 30, t = 30),
+        legend.position = "bottom")
+main_map
+
+
+# Create the inset map for Alaska
+inset_map <- ggplot() +
+  geom_sf(data = alaska, fill = "gray95", color = "black", lwd = 0.4) +
+  geom_sf(data = wells, shape = 21, fill = "deepskyblue4", color = "black", size = 1, stroke = 0.3) +
+  theme_map() +
+  coord_sf(xlim = c(-2500000, 1500000), ylim = c(500000, 2500000)) +
+  theme(legend.position="none")
+inset_map
+
+# Combine & overlay
+ggdraw() +
+  draw_plot(main_map) +
+  draw_plot(inset_map,
+            height = 0.3,
+            x=-0.3,
+            y=0.15)
+
+##################################################
+# Vector of all 50 U.S. state names
+state_names <- conus$NAME
+
+# Create a dataframe with a column for well counts (starting as NA)
+my_data <- data.frame(
+  state = state_names,
+  well_count = c(0, 0, 0, 0, 0, 
+                 297, 0, 574, 2, 8564, 
+                 4920, 15367, 2216, 23, 0,
+                 0, 353, 0, 21155, 13, 
+                 1745, 80, 18816, 897, 6161, 
+                 7564, 492, 690, 92, 0, 
+                 0, 0, 0, 0, 0, 
+                 0, 0, 4899, 0, 0, 
+                 382, 4290, 938, 0, 0, 
+                 24, 0, 506, 0)
+)
+
+# Join 
+conus <- conus %>%
+  left_join(my_data, by = c("NAME" = "state"))
+
+# Get state centroids for label placement
+conus_centroids <- st_centroid(conus) %>% 
+  mutate(well_count = conus$well_count)
+
+# Extract coordinates
+coords <- st_coordinates(conus_centroids)
+
+# Shift where needed
+coords[conus_centroids$NAME == "Florida", ]  <- coords[conus_centroids$NAME == "Florida", ]  + c(100000, 0)
+coords[conus_centroids$NAME == "Michigan", ] <- coords[conus_centroids$NAME == "Michigan", ] + c(100000, -100000)
+coords[conus_centroids$NAME == "Louisiana", ]  <- coords[conus_centroids$NAME == "Louisiana", ]  + c(0, -100000)
+
+# Put shifted coordinates back into geometry
+st_geometry(conus_centroids) <- st_sfc(
+  lapply(seq_len(nrow(coords)), function(i) st_point(coords[i, ])),
+  crs = st_crs(conus_centroids)
+)
+
+conus_centroids <- conus_centroids %>%
+  mutate(
+    X = st_coordinates(.)[,1],
+    Y = st_coordinates(.)[,2]
+  )
+
+# Create main choropleth map
+main_map <- ggplot() +
+  geom_sf(data = conus, aes(fill = well_count), color = "black", lwd = 0.4, alpha = 0.9) +
+  geom_sf(data = missing_states, fill = "white", color = "black", lwd = 0.4) +
+  scale_fill_gradientn(name = "Well Count", colors = RColorBrewer::brewer.pal(9, "Blues"),
+                       trans = "log",
+                       breaks = c(1, 100, 1000, 10000),
+                       labels = scales::comma_format()) +
+  geom_text(data = conus_centroids %>% filter(well_count > 0),
+            aes(x = X, y = Y, label = well_count),
+            color = "red", size = 3, fontface = "bold") +  # Adds well count labels
+  theme_map() +
+  coord_sf(xlim = c(-2500000, 2500000), ylim = c(100000, 3200000)) +
+  theme(plot.margin = margin(l = 30, b = 30, t = 30),
+        legend.position = "bottom",
+        legend.key.width = unit(2, "cm"))
+main_map
+
+# Alaska map with well count 
+alaska_wells <- wells[wells$state == "Alaska",] 
+alaska_wells <- st_transform(alaska_wells, crs = 3338)
+alaska$well_count <- lengths(st_intersects(alaska, alaska_wells))
+alaska_centroids <- st_centroid(alaska) %>% 
+  mutate(well_count = alaska$well_count)
+
+inset_map <- ggplot() +
+  geom_sf(data = alaska, color = "black", fill = "#F7FBFF", lwd = 0.4, alpha = 0.8) +
+  geom_text(data = alaska_centroids, aes(x = st_coordinates(geometry)[,1], 
+                                         y = st_coordinates(geometry)[,2], 
+                                         label = well_count,
+                                         fontface = "bold"),
+            color = "red", size = 3) +
+  theme_map() +
+  coord_sf(xlim = c(-2500000, 1500000), ylim = c(500000, 2500000)) +
+  theme(legend.position = "none")
+inset_map
+
+
+# Combine main and inset maps
+ggdraw() +
+  draw_plot(main_map) +
+  draw_plot(inset_map,
+            height = 0.3,
+            x = -0.3,
+            y = 0.15)
+
+###############################################################################
+################################# Barchart 1 ################################
+###############################################################################
+# create a dataset
+m
+specie <- c(rep("sorgho" , 3) , rep("poacee" , 3) , rep("banana" , 3) , rep("triticum" , 3) )
+condition <- rep(c("normal" , "stress" , "Nitrogen") , 4)
+value <- abs(rnorm(12 , 0 , 15))
+data <- data.frame(specie,condition,value)
+ 
+# Grouped
+ggplot(data, aes(fill=condition, y=value, x=specie)) + 
+    geom_bar(position="dodge", stat="identity")
+
+```
+
+
+```{r barplots}
+df <- data.frame(
+  state = c("Pennsylvania", "Oklahoma", "Kentucky", "Texas", "New York", "West Virginia", 
+            "California", "Missouri", "Louisiana", "Ohio"),
+  total_orphaned = c(21155, 18816, 15367, 8564, 7564, 6161, 4920, 4899, 4290, 2216),
+  newly_orphaned = c(6388, 7613, 3780, 6203, 645, 2747, 2135, 4899, 1308, 991),
+  newly_plugged = c(295, 7613, 0, 1821, 59, 113, 151, 0, 880, 163)
+)
+
+
+# Calculate old orphaned counts
+df <- df %>%
+  mutate(old_orphaned = total_orphaned - newly_orphaned)
+
+# Reshape orphaned wells for stacked bar (by count)
+orphaned_long <- df %>%
+  pivot_longer(
+    cols = c(total_orphaned, newly_orphaned),
+    names_to = "well_type",
+    values_to = "count"
+  )
+
+# Reshape plugged wells for standalone bar
+plugged_long <- df %>%
+  pivot_longer(
+    cols = "newly_plugged",
+    names_to = "well_type",
+    values_to = "count"
+  )
+
+# Order states by descending total_orphaned
+df <- df %>%
+  mutate(state = fct_reorder(state, -total_orphaned))
+
+# Apply this ordering to both long datasets
+orphaned_long <- orphaned_long %>%
+  mutate(state = factor(state, levels = levels(df$state)))
+
+plugged_long <- plugged_long %>%
+  mutate(state = factor(state, levels = levels(df$state)))
+
+#######################################
+# Plot
+ggplot() +
+  # Orphaned wells stacked by count
+  geom_bar(data = orphaned_long,
+           aes(x = state, y = count, fill =well_type),
+           stat = "identity",
+           position = position_nudge(x = -0.15), width = 0.3) +
+  # Newly plugged wells side-by-side
+  geom_bar(data = plugged_long,
+           aes(x = state, y = count, fill = well_type),
+           stat = "identity", position = position_nudge(x = 0.15), width = 0.3) +
+  labs(x = "", y = "Well Count", fill = "Well Type",
+       title = "2025 Orphaned Wells (stacked) and Newly Plugged Wells by State") +
+  scale_fill_manual(values = c("newly_orphaned" = "lightblue",
+                               "total_orphaned" = "darkblue",
+                               "newly_plugged" = "darkgreen"),
+                    labels = c("newly_orphaned" = "Newly Orphaned",
+                               "total_orphaned" = "Orphaned since 2022",
+                               "newly_plugged" = "Newly Plugged")) +
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 90))
+
+
+
+```
+
+``` 
+
